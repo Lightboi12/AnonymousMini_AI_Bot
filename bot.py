@@ -21,11 +21,11 @@ dp = Dispatcher()
 @dp.message(Command("start"))
 async def start_command(message: Message):
     await message.answer(
-        "👋 Welcome to Anonymous™ Mini AI!\n\n"
-        "🤖 Your personal mini ai bot is ready.\n"
+        "👋 Welcome to Anonymous™ Mini!\n\n"
+        "🤖 Your personal mini bot is ready.\n"
         "⚡ Fast • Simple • Easy to use\n\n"
         "👤 Created by: @i_amanonymous\n"
-        "💬 Use /help to get started!"
+        "💬 Use the buttons below to get started!"
     )
 
 
