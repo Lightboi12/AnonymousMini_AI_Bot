@@ -1,6 +1,7 @@
 services:
-  - type: worker
+  - type: web
     name: anonymous-mini
     runtime: python
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
