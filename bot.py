@@ -29,6 +29,10 @@ async def start_command(message: Message):
     )
 
 
+@dp.message(Command("ping"))
+async def ping_command(message: Message):
+    await message.answer("Anonymous™ is active🙂‍↕️")
+    
 # Small web server for Render
 async def health(request):
     return web.Response(text="Anonymous™ Mini is running!")
