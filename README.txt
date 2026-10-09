@@ -19,3 +19,10 @@ Notes:
 - /riddle now hides the answer and checks the next message from the same user in the same chat.
 - In groups, AI replies when someone mentions Anonymous or replies to the bot's message.
 - Riddle state is in memory and resets when the service restarts.
+
+
+FOUNDER FEATURE
+- The founder name is shown as a clickable link to https://t.me/i_amanonymous.
+- Founder questions are answered directly before the general group AI handler.
+- Keep TOKEN and GEMINI_API_KEY in Render Environment variables; never commit secrets.
+- This package is based on the Gemini-enabled Anonymous Mini update.

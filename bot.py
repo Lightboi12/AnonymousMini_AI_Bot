@@ -28,6 +28,15 @@ TOKEN = os.getenv("TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 PORT = int(os.getenv("PORT", "10000"))
 
+
+# Founder identity: the displayed name is clickable and opens the Telegram profile.
+FOUNDER_NAME = "𝐋 𝐎 𝐑 𝐃 ♰ 𝐀𝐍𝐎𝐍𝐘𝐌𝐎𝐔𝐒™"
+FOUNDER_URL = "https://t.me/i_amanonymous"
+FOUNDER_REPLY = (
+    f'My founder is <a href="{FOUNDER_URL}">'
+    f'{FOUNDER_NAME}</a> 👑🔥'
+)
+
 if not TOKEN:
     raise RuntimeError("Missing TOKEN environment variable. Add your Telegram bot token in Render → Environment.")
 
@@ -508,6 +517,26 @@ async def warnings_command(message: Message):
     if not target: return
     count = WARNINGS.get((message.chat.id, target.id), 0)
     await message.answer(f"⚠️ {target.full_name} has {count}/3 warning(s) in this running session.")
+
+
+@dp.message(
+    F.text
+    & (
+        F.text.lower().contains("who is your founder")
+        | F.text.lower().contains("who's your founder")
+        | F.text.lower().contains("who is your creator")
+        | F.text.lower().contains("who created you")
+        | F.text.lower().contains("who made you")
+        | F.text.lower().contains("who owns you")
+        | F.text.lower().contains("who is your owner")
+    )
+)
+async def founder_handler(message: Message):
+    await message.answer(
+        FOUNDER_REPLY,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
 
 
 @dp.message(F.text)
