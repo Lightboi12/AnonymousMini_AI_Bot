@@ -366,7 +366,7 @@ async def ai_command(message: Message):
         await message.answer("🤖 Ask me something: /ai explain black holes simply")
         return
     if ai_client is None:
-        await message.answer("⚠️ AI is not configured yet. Add OPENAI_API_KEY in Render → Environment to enable it.")
+        await message.answer("⚠️ AI is not configured yet. Add GEMINI_API_KEY in Render → Environment to enable it.")
         return
     await ask_ai(message, prompt)
 
