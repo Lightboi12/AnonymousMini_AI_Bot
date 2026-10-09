@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import random
+import re
 import time
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
@@ -9,13 +10,14 @@ from aiogram.enums import ChatType
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    ChatMember, BotCommand
+    BotCommand
 )
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from openai import AsyncOpenAI
 
-# Anonymous™ Mini — refreshed menu, fun commands, and optional AI.
+# Anonymous™ Mini — multi-AI fallback, fun commands, and group moderation.
 # Required Render environment variable: TOKEN
-# Optional: GEMINI_API_KEY
+# Optional AI environment variables:
+# GEMINI_API_KEY, GROQ_API_KEY, OPENROUTER_API_KEY, CEREBRAS_API_KEY
 # This app uses long polling plus a small HTTP health endpoint for Render.
 
 logging.basicConfig(
@@ -26,8 +28,10 @@ log = logging.getLogger("anonymous-mini")
 
 TOKEN = os.getenv("TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY", "").strip()
 PORT = int(os.getenv("PORT", "10000"))
-
 
 # Founder identity: the displayed name is clickable and opens the Telegram profile.
 FOUNDER_NAME = "𝐋 𝐎 𝐑 𝐃 ♰ 𝐀𝐍𝐎𝐍𝐘𝐌𝐎𝐔𝐒™"
@@ -38,24 +42,62 @@ FOUNDER_REPLY = (
 )
 
 if not TOKEN:
-    raise RuntimeError("Missing TOKEN environment variable. Add your Telegram bot token in Render → Environment.")
+    raise RuntimeError(
+        "Missing TOKEN environment variable. Add your Telegram bot token in Render → Environment."
+    )
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 started_at = time.time()
 bot_username = ""
-ai_client = None
+
+# AI providers are optional. Add any provider API key in Render Environment.
+AI_PROVIDERS = []
 
 if GEMINI_API_KEY:
     try:
         from google import genai
-        ai_client = genai.Client(api_key=GEMINI_API_KEY)
+        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+        AI_PROVIDERS.append(("Gemini", "gemini", gemini_client))
     except Exception:
-        log.exception("Gemini client could not be initialized. AI commands will be unavailable.")
+        log.exception("Gemini client could not be initialized.")
+
+if GROQ_API_KEY:
+    AI_PROVIDERS.append((
+        "Groq", "openai",
+        AsyncOpenAI(
+            api_key=GROQ_API_KEY,
+            base_url="https://api.groq.com/openai/v1",
+            timeout=35.0,
+            max_retries=0,
+        )
+    ))
+
+if OPENROUTER_API_KEY:
+    AI_PROVIDERS.append((
+        "OpenRouter", "openai",
+        AsyncOpenAI(
+            api_key=OPENROUTER_API_KEY,
+            base_url="https://openrouter.ai/api/v1",
+            timeout=35.0,
+            max_retries=0,
+            default_headers={"X-OpenRouter-Title": "Anonymous Mini"},
+        )
+    ))
+
+if CEREBRAS_API_KEY:
+    AI_PROVIDERS.append((
+        "Cerebras", "openai",
+        AsyncOpenAI(
+            api_key=CEREBRAS_API_KEY,
+            base_url="https://api.cerebras.ai/v1",
+            timeout=35.0,
+            max_retries=0,
+        )
+    ))
 
 # Active riddles are kept per chat and user while this process is running.
 ACTIVE_RIDDLES = {}
-
 
 def main_menu() -> InlineKeyboardMarkup:
     add_group_url = f"https://t.me/{bot_username}?startgroup=true" if bot_username else "https://t.me/"
@@ -76,8 +118,10 @@ def back_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🏠 Main Menu", callback_data="menu:home")],
         [
             InlineKeyboardButton(text="📚 Commands", callback_data="menu:commands"),
-            InlineKeyboardButton(text="➕ Add to Group",
-                                 url=f"https://t.me/{bot_username}?startgroup=true" if bot_username else "https://t.me/"),
+            InlineKeyboardButton(
+                text="➕ Add to Group",
+                url=f"https://t.me/{bot_username}?startgroup=true" if bot_username else "https://t.me/"
+            ),
         ],
     ])
 
@@ -88,7 +132,8 @@ HELP_TEXT = (
     "• Use the buttons below to explore.\n"
     "• In groups, reply to a message when using moderation commands.\n"
     "• Group moderation commands generally require admin permissions.\n"
-    "• AI requires the OPENAI_API_KEY environment variable."
+    "• AI works when at least one provider API key is added in Render Environment.\n"
+    "• If one AI provider reaches its limit, I try the next configured provider."
 )
 
 COMMANDS_TEXT = (
@@ -113,17 +158,17 @@ COMMANDS_TEXT = (
     "/quiz — Quick multiple-choice quiz\n"
     "/ship @user @user — Fun compatibility score\n\n"
     "🤖 AI\n"
-    "/ai your question — Ask AI (requires API key)\n"
+    "/ai your question — Ask AI (requires at least one API key)\n"
     "In groups, mention Anonymous followed by your question.\n\n"
     "🛡️ Group admins\n"
     "/ban, /unban, /kick, /mute, /unmute, /warn, /warnings\n"
-    "Use these in a group and reply to the person’s message."
+    "Use these in a group and reply to the person's message."
 )
 
 ABOUT_TEXT = (
     "👑 Anonymous™ Mini\n\n"
     "Your personal mini bot — fast, simple, and easy to use.\n\n"
-    "✨ Fun commands • Group tools • AI chat\n"
+    "✨ Fun commands • Group tools • Multi-AI chat\n"
     "🛠️ Created by: @i_amanonymous\n\n"
     "Use the menu buttons to explore, or add me to your group."
 )
@@ -188,6 +233,30 @@ EIGHT_BALL = [
     "🎱 The signs point to yes.", "🎱 Better not tell you now.",
     "🎱 Very doubtful.", "🎱 It is possible.", "🎱 Focus and try again."
 ]
+
+# No-repeat decks: each item is used once before that category starts a new round.
+# This prevents jokes, riddles, and quotes from repeating until their lists cycle through.
+_NO_REPEAT_DECKS = {}
+
+def pick_without_repeat(category: str, items: list):
+    if not items:
+        raise ValueError(f"No items available for category: {category}")
+
+    deck = _NO_REPEAT_DECKS.get(category, [])
+    # Rebuild when the deck is empty or the source list has changed.
+    if not deck:
+        deck = list(items)
+        random.shuffle(deck)
+
+        # Avoid repeating the previous round's last item as the first item of a new round.
+        previous = _NO_REPEAT_DECKS.get(f"{category}:last")
+        if len(deck) > 1 and deck[-1] == previous:
+            deck[0], deck[-1] = deck[-1], deck[0]
+
+    chosen = deck.pop()
+    _NO_REPEAT_DECKS[category] = deck
+    _NO_REPEAT_DECKS[f"{category}:last"] = chosen
+    return chosen
 
 WARNINGS = {}  # In-memory warning counts; they reset if the service restarts.
 MUTE_MINUTES_DEFAULT = 10
@@ -281,7 +350,7 @@ async def ping(message: Message):
 
 @dp.message(Command("joke"))
 async def joke(message: Message):
-    await message.answer(random.choice(JOKES))
+    await message.answer(pick_without_repeat("jokes", JOKES))
 
 
 @dp.message(Command("fact"))
@@ -291,7 +360,7 @@ async def fact(message: Message):
 
 @dp.message(Command("quote"))
 async def quote(message: Message):
-    await message.answer(random.choice(QUOTES))
+    await message.answer(pick_without_repeat("quotes", QUOTES))
 
 
 @dp.message(Command("roll"))
@@ -330,9 +399,11 @@ async def dare(message: Message):
 
 @dp.message(Command("riddle"))
 async def riddle(message: Message):
-    question, answer = random.choice(RIDDLES)
+    question, answer = pick_without_repeat("riddles", RIDDLES)
     ACTIVE_RIDDLES[(message.chat.id, message.from_user.id)] = (question, answer)
-    await message.answer(f"🧩 RIDDLE: {question}\n\nReply with your guess! I'll tell you whether you're right. 🤔")
+    await message.answer(
+        f"🧩 RIDDLE: {question}\n\nReply with your guess! I'll tell you whether you're right. 🤔"
+    )
 
 
 @dp.message(Command("quiz"))
@@ -351,9 +422,13 @@ async def quiz_answer(callback: CallbackQuery):
         _, correct_s, chosen_s, option = callback.data.split(":", 3)
         correct, chosen = int(correct_s), int(chosen_s)
         if chosen == correct:
-            await callback.message.edit_text(f"✅ Correct! {option} — you earned 10,000 fun coins in spirit! 🪙")
+            await callback.message.edit_text(
+                f"✅ Correct! {option} — you earned 10,000 fun coins in spirit! 🪙"
+            )
         else:
-            await callback.message.edit_text(f"❌ Not quite! You chose {option}. Try another /quiz.")
+            await callback.message.edit_text(
+                f"❌ Not quite! You chose {option}. Try another /quiz."
+            )
     except Exception:
         await callback.answer("This quiz has expired.", show_alert=True)
         return
@@ -369,7 +444,9 @@ async def ship(message: Message):
         return
     score = random.randint(0, 100)
     emoji = "💖" if score >= 75 else ("💛" if score >= 40 else "💔")
-    await message.answer(f"💘 Compatibility for {names[0]} + {names[1]}: {score}% {emoji}\n(Just for fun!)")
+    await message.answer(
+        f"💘 Compatibility for {names[0]} + {names[1]}: {score}% {emoji}\n(Just for fun!)"
+    )
 
 
 @dp.message(Command("ai"))
@@ -378,60 +455,109 @@ async def ai_command(message: Message):
     if not prompt:
         await message.answer("🤖 Ask me something: /ai explain black holes simply")
         return
-    if ai_client is None:
-        await message.answer("⚠️ Gemini AI isn't configured. Add GEMINI_API_KEY in Render → Environment.")
+    if not AI_PROVIDERS:
+        await message.answer(
+            "⚠️ No AI provider is configured. Add at least one API key in Render → Environment."
+        )
         return
     await ask_ai(message, prompt)
 
 
 async def ask_ai(message: Message, prompt: str):
-    if ai_client is None:
-        return
-    try:
-        response = await ai_client.aio.models.generate_content(
-            model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
-            contents=("You are Anonymous™ Mini, a friendly, concise Telegram assistant. "
-                      "Answer helpfully and naturally. Do not output HTML tags.\n\n" + prompt),
-        )
-        answer = (getattr(response, "text", None) or "").strip()
-        if not answer:
-            answer = "I couldn't form an answer just now. Please try again."
-        if len(answer) > 4000:
-            answer = answer[:3900] + "\n\n…(message shortened)"
-        await message.reply(answer)
-    except Exception as exc:
-        log.exception("Gemini AI request failed")
-        name = type(exc).__name__.lower()
-        detail = str(exc).lower()
-        if "auth" in name or "api key" in detail or "permission" in name:
-            reply = "⚠️ Gemini rejected the API key. Check GEMINI_API_KEY in Render Environment."
-        elif "quota" in detail or "rate" in name or "resource_exhausted" in detail:
-            reply = "⚠️ Gemini free-tier usage limit reached. Try again later or check your AI Studio limits."
-        elif "model" in detail or "not found" in detail:
-            reply = "⚠️ The Gemini model isn't available for this key. Check GEMINI_MODEL in Render."
-        else:
-            reply = "⚠️ Gemini couldn't answer just now. Check the latest Render logs for the exact error."
-        await message.reply(reply)
+    """Try configured AI providers one by one until one returns a usable answer."""
+    system_prompt = (
+        "You are Anonymous™ Mini, a friendly, concise Telegram assistant. "
+        "Answer helpfully and naturally. Do not output HTML tags."
+    )
+    failures = []
+
+    for provider_name, provider_type, client in AI_PROVIDERS:
+        try:
+            log.info("Trying AI provider: %s", provider_name)
+
+            if provider_type == "gemini":
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        client.models.generate_content,
+                        model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+                        contents=system_prompt + "\n\nUser question: " + prompt,
+                    ),
+                    timeout=35,
+                )
+                answer = (getattr(response, "text", None) or "").strip()
+            else:
+                if provider_name == "Groq":
+                    model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+                elif provider_name == "OpenRouter":
+                    model = os.getenv("OPENROUTER_MODEL", "openrouter/free")
+                else:
+                    model = os.getenv("CEREBRAS_MODEL", "gpt-oss-120b")
+
+                response = await asyncio.wait_for(
+                    client.chat.completions.create(
+                        model=model,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": prompt},
+                        ],
+                        max_tokens=900,
+                    ),
+                    timeout=40,
+                )
+                answer = (response.choices[0].message.content or "").strip()
+
+            if not answer:
+                raise RuntimeError("Provider returned an empty answer.")
+
+            if len(answer) > 4000:
+                answer = answer[:3900] + "\n\n…(message shortened)"
+
+            log.info("AI response succeeded with provider: %s", provider_name)
+            await message.reply(answer)
+            return
+
+        except Exception as exc:
+            log.warning(
+                "AI provider %s failed (%s): %s",
+                provider_name, type(exc).__name__, str(exc)[:250]
+            )
+            failures.append(provider_name)
+
+    log.error("All configured AI providers failed: %s", ", ".join(failures))
+    await message.reply(
+        "⚠️ All configured AI providers are busy or unavailable right now. "
+        "Please try again in a little while. If this keeps happening, check the API keys, "
+        "model names, usage limits, and latest Render logs."
+    )
 
 
 # Reply-based group moderation commands.
 @dp.message(Command("ban"))
 async def ban_command(message: Message):
-    if not await require_admin(message): return
+    if not await require_admin(message):
+        return
     target = await replied_target(message)
-    if not target: return
+    if not target:
+        return
     try:
         await bot.ban_chat_member(message.chat.id, target.id)
-        await message.answer(f"🔨 Banned <a href=\"tg://user?id={target.id}\">{target.full_name}.")
+        await message.answer(
+            f'🔨 Banned <a href="tg://user?id={target.id}">{target.full_name}</a>.',
+            parse_mode="HTML"
+        )
     except Exception as e:
-        await message.answer(f"❌ I couldn't ban that user. Check my admin permissions.\n{type(e).__name__}")
+        await message.answer(
+            f"❌ I couldn't ban that user. Check my admin permissions.\n{type(e).__name__}"
+        )
 
 
 @dp.message(Command("unban"))
 async def unban_command(message: Message):
-    if not await require_admin(message): return
+    if not await require_admin(message):
+        return
     target = await replied_target(message)
-    if not target: return
+    if not target:
+        return
     try:
         await bot.unban_chat_member(message.chat.id, target.id, only_if_banned=True)
         await message.answer(f"✅ Unbanned {target.full_name} (if they were banned).")
@@ -441,9 +567,11 @@ async def unban_command(message: Message):
 
 @dp.message(Command("kick"))
 async def kick_command(message: Message):
-    if not await require_admin(message): return
+    if not await require_admin(message):
+        return
     target = await replied_target(message)
-    if not target: return
+    if not target:
+        return
     try:
         await bot.ban_chat_member(message.chat.id, target.id)
         await bot.unban_chat_member(message.chat.id, target.id, only_if_banned=True)
@@ -454,15 +582,18 @@ async def kick_command(message: Message):
 
 @dp.message(Command("mute"))
 async def mute_command(message: Message):
-    if not await require_admin(message): return
+    if not await require_admin(message):
+        return
     target = await replied_target(message)
-    if not target: return
+    if not target:
+        return
     try:
         from datetime import datetime, timedelta, timezone
-        until = datetime.now(timezone.utc) + timedelta(minutes=MUTE_MINUTES_DEFAULT)
         from aiogram.types import ChatPermissions
+        until = datetime.now(timezone.utc) + timedelta(minutes=MUTE_MINUTES_DEFAULT)
         await bot.restrict_chat_member(
-            message.chat.id, target.id, permissions=ChatPermissions(can_send_messages=False),
+            message.chat.id, target.id,
+            permissions=ChatPermissions(can_send_messages=False),
             until_date=until
         )
         await message.answer(f"🔇 Muted {target.full_name} for {MUTE_MINUTES_DEFAULT} minutes.")
@@ -472,9 +603,11 @@ async def mute_command(message: Message):
 
 @dp.message(Command("unmute"))
 async def unmute_command(message: Message):
-    if not await require_admin(message): return
+    if not await require_admin(message):
+        return
     target = await replied_target(message)
-    if not target: return
+    if not target:
+        return
     try:
         from aiogram.types import ChatPermissions
         await bot.restrict_chat_member(
@@ -493,9 +626,11 @@ async def unmute_command(message: Message):
 
 @dp.message(Command("warn"))
 async def warn_command(message: Message):
-    if not await require_admin(message): return
+    if not await require_admin(message):
+        return
     target = await replied_target(message)
-    if not target: return
+    if not target:
+        return
     key = (message.chat.id, target.id)
     WARNINGS[key] = WARNINGS.get(key, 0) + 1
     count = WARNINGS[key]
@@ -506,17 +641,24 @@ async def warn_command(message: Message):
             WARNINGS[key] = 0
             await message.answer(f"🚫 {target.full_name} reached 3 warnings and was kicked.")
         except Exception:
-            await message.answer(f"⚠️ {target.full_name} has {count}/3 warnings. I couldn't kick them; check my admin permissions.")
+            await message.answer(
+                f"⚠️ {target.full_name} has {count}/3 warnings. I couldn't kick them; check my admin permissions."
+            )
     else:
-        await message.answer(f"⚠️ Warned {target.full_name}: {count}/3. Three warnings trigger a kick.")
+        await message.answer(
+            f"⚠️ Warned {target.full_name}: {count}/3. Three warnings trigger a kick."
+        )
 
 
 @dp.message(Command("warnings"))
 async def warnings_command(message: Message):
     target = await replied_target(message)
-    if not target: return
+    if not target:
+        return
     count = WARNINGS.get((message.chat.id, target.id), 0)
-    await message.answer(f"⚠️ {target.full_name} has {count}/3 warning(s) in this running session.")
+    await message.answer(
+        f"⚠️ {target.full_name} has {count}/3 warning(s) in this running session."
+    )
 
 
 @dp.message(
@@ -551,42 +693,48 @@ async def game_and_group_ai_handler(message: Message):
     if active:
         question, answer = active
         normalized = "".join(ch.lower() for ch in text if ch.isalnum())
-        expected = "".join(ch.lower() for ch in answer.split("🥚")[0].split("🎹")[0].split("🧻")[0].split("🕒")[0].split("🎂")[0] if ch.isalnum())
-        # Compare the main answer words, ignoring punctuation and emoji.
         answer_words = answer.lower().split()
-        accepted = ["".join(ch for ch in word.lower() if ch.isalnum()) for word in answer_words]
+        accepted = [
+            "".join(ch for ch in word.lower() if ch.isalnum())
+            for word in answer_words
+        ]
         accepted_text = "".join(ch for ch in answer.lower() if ch.isalnum())
-        if normalized == accepted_text or normalized in accepted or (expected and normalized == expected):
+        if normalized == accepted_text or normalized in accepted:
             ACTIVE_RIDDLES.pop(key, None)
             await message.reply("✅ Correct! Well done! 🎉")
         else:
             ACTIVE_RIDDLES.pop(key, None)
-            await message.reply(f"❌ Not quite! The correct answer was {answer}. Try /riddle for another one. 🧩")
+            await message.reply(
+                f"❌ Not quite! The correct answer was {answer}. Try /riddle for another one. 🧩"
+            )
         return
 
     # Group AI responds when Anonymous is mentioned or someone replies to the bot.
     if message.chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
         return
+
     is_mention = "anonymous" in text.lower()
-    replied_to_bot = bool(
-        message.reply_to_message
-        and message.reply_to_message.from_user
-        and message.reply_to_message.from_user.is_bot
-        and message.reply_to_message.from_user.id == (await bot.get_me()).id
-    )
+    replied_to_bot = False
+    if message.reply_to_message and message.reply_to_message.from_user:
+        if message.reply_to_message.from_user.is_bot:
+            me = await bot.get_me()
+            replied_to_bot = message.reply_to_message.from_user.id == me.id
+
     if not is_mention and not replied_to_bot:
         return
+
     prompt = text
     if is_mention:
-        import re
         prompt = re.sub(r"(?i)anonymous(?:™)?\s*", "", prompt, count=1).strip(" ,:!?-\n")
     if not prompt and replied_to_bot:
         prompt = text
     if not prompt:
         await message.reply("🤖 Yes? Ask me anything!")
         return
-    if ai_client is None:
-        await message.reply("🤖 Gemini AI isn't configured. An admin needs to add GEMINI_API_KEY in Render Environment.")
+    if not AI_PROVIDERS:
+        await message.reply(
+            "🤖 AI isn't configured yet. An admin needs to add at least one AI provider API key in Render Environment."
+        )
         return
     await ask_ai(message, prompt)
 
@@ -596,7 +744,8 @@ async def health_handler(request):
         "status": "ok",
         "service": "Anonymous Mini",
         "uptime_seconds": int(time.time() - started_at),
-        "telegram_bot": "initialized"
+        "telegram_bot": "initialized",
+        "ai_providers_configured": [provider[0] for provider in AI_PROVIDERS],
     })
 
 
@@ -617,6 +766,8 @@ async def main():
     me = await bot.get_me()
     bot_username = me.username or ""
     log.info("Starting @%s", bot_username)
+    log.info("Configured AI providers: %s", [provider[0] for provider in AI_PROVIDERS])
+
     commands = [
         BotCommand(command="start", description="Open the main menu"),
         BotCommand(command="help", description="Get help"),
@@ -634,7 +785,15 @@ async def main():
         BotCommand(command="dare", description="Get a dare"),
         BotCommand(command="riddle", description="Get a riddle"),
         BotCommand(command="quiz", description="Play a quick quiz"),
+        BotCommand(command="ship", description="Check fun compatibility"),
         BotCommand(command="ai", description="Ask AI"),
+        BotCommand(command="ban", description="Ban a replied-to user"),
+        BotCommand(command="unban", description="Unban a replied-to user"),
+        BotCommand(command="kick", description="Kick a replied-to user"),
+        BotCommand(command="mute", description="Mute a replied-to user"),
+        BotCommand(command="unmute", description="Unmute a replied-to user"),
+        BotCommand(command="warn", description="Warn a replied-to user"),
+        BotCommand(command="warnings", description="Check warnings"),
     ]
     await bot.set_my_commands(commands)
     runner = await start_http_server()
@@ -643,6 +802,12 @@ async def main():
     finally:
         await runner.cleanup()
         await bot.session.close()
+        for _, provider_type, client in AI_PROVIDERS:
+            if provider_type == "openai":
+                try:
+                    await client.close()
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":
