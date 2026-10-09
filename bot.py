@@ -42,7 +42,10 @@ if GEMINI_API_KEY:
         from google import genai
         ai_client = genai.Client(api_key=GEMINI_API_KEY)
     except Exception:
-        log.exception("Gemini client could not be initialized.")
+        log.exception("Gemini client could not be initialized. AI commands will be unavailable.")
+
+# Active riddles are kept per chat and user while this process is running.
+ACTIVE_RIDDLES = {}
 
 
 def main_menu() -> InlineKeyboardMarkup:
@@ -319,7 +322,8 @@ async def dare(message: Message):
 @dp.message(Command("riddle"))
 async def riddle(message: Message):
     question, answer = random.choice(RIDDLES)
-    await message.answer(f"🧩 RIDDLE: {question}\n\nReply with your guess! (Answer: {answer})")
+    ACTIVE_RIDDLES[(message.chat.id, message.from_user.id)] = (question, answer)
+    await message.answer(f"🧩 RIDDLE: {question}\n\nReply with your guess! I'll tell you whether you're right. 🤔")
 
 
 @dp.message(Command("quiz"))
@@ -366,7 +370,7 @@ async def ai_command(message: Message):
         await message.answer("🤖 Ask me something: /ai explain black holes simply")
         return
     if ai_client is None:
-        await message.answer("⚠️ AI is not configured yet. Add GEMINI_API_KEY in Render → Environment to enable it.")
+        await message.answer("⚠️ Gemini AI isn't configured. Add GEMINI_API_KEY in Render → Environment.")
         return
     await ask_ai(message, prompt)
 
@@ -375,30 +379,29 @@ async def ask_ai(message: Message, prompt: str):
     if ai_client is None:
         return
     try:
-        response = await ai_client.responses.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
-            input=[
-                {"role": "system", "content": "You are Anonymous™ Mini, a friendly, concise Telegram assistant. Be helpful and fun."},
-                {"role": "user", "content": prompt}
-            ],
-            max_output_tokens=500,
+        response = await ai_client.aio.models.generate_content(
+            model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+            contents=("You are Anonymous™ Mini, a friendly, concise Telegram assistant. "
+                      "Answer helpfully and naturally. Do not output HTML tags.\n\n" + prompt),
         )
-        answer = response.output_text.strip() or "I couldn't form an answer just now. Try again."
+        answer = (getattr(response, "text", None) or "").strip()
+        if not answer:
+            answer = "I couldn't form an answer just now. Please try again."
         if len(answer) > 4000:
             answer = answer[:3900] + "\n\n…(message shortened)"
         await message.reply(answer)
     except Exception as exc:
-        log.exception("AI request failed")
-        # Give a useful hint without exposing secret keys or internal API details.
-        error_name = type(exc).__name__.lower()
-        if "authentication" in error_name or "permission" in error_name:
-            reply = "⚠️ The AI key was rejected. Check OPENAI_API_KEY in Render → Environment."
-        elif "rate" in error_name or "quota" in str(exc).lower() or "billing" in str(exc).lower():
-            reply = "⚠️ The AI service has reached a usage limit. Check your OpenAI API billing and usage."
-        elif "model" in str(exc).lower():
-            reply = "⚠️ The selected AI model may not be available. Check OPENAI_MODEL in Render → Environment, or remove it to use the default model."
+        log.exception("Gemini AI request failed")
+        name = type(exc).__name__.lower()
+        detail = str(exc).lower()
+        if "auth" in name or "api key" in detail or "permission" in name:
+            reply = "⚠️ Gemini rejected the API key. Check GEMINI_API_KEY in Render Environment."
+        elif "quota" in detail or "rate" in name or "resource_exhausted" in detail:
+            reply = "⚠️ Gemini free-tier usage limit reached. Try again later or check your AI Studio limits."
+        elif "model" in detail or "not found" in detail:
+            reply = "⚠️ The Gemini model isn't available for this key. Check GEMINI_MODEL in Render."
         else:
-            reply = "⚠️ AI request failed. Check Render → Logs for the exact error, and verify OPENAI_API_KEY and API billing."
+            reply = "⚠️ Gemini couldn't answer just now. Check the latest Render logs for the exact error."
         await message.reply(reply)
 
 
@@ -507,22 +510,56 @@ async def warnings_command(message: Message):
     await message.answer(f"⚠️ {target.full_name} has {count}/3 warning(s) in this running session.")
 
 
-@dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}), F.text)
-async def group_ai_mention(message: Message):
-    text = message.text or ""
-    if "anonymous" not in text.lower():
+@dp.message(F.text)
+async def game_and_group_ai_handler(message: Message):
+    text = (message.text or "").strip()
+    if not text or text.startswith("/") or not message.from_user:
         return
-    # Avoid responding to bot commands such as /commands.
-    if text.lstrip().startswith("/"):
+
+    # Check a user's answer to their active riddle first.
+    key = (message.chat.id, message.from_user.id)
+    active = ACTIVE_RIDDLES.get(key)
+    if active:
+        question, answer = active
+        normalized = "".join(ch.lower() for ch in text if ch.isalnum())
+        expected = "".join(ch.lower() for ch in answer.split("🥚")[0].split("🎹")[0].split("🧻")[0].split("🕒")[0].split("🎂")[0] if ch.isalnum())
+        # Compare the main answer words, ignoring punctuation and emoji.
+        answer_words = answer.lower().split()
+        accepted = ["".join(ch for ch in word.lower() if ch.isalnum()) for word in answer_words]
+        accepted_text = "".join(ch for ch in answer.lower() if ch.isalnum())
+        if normalized == accepted_text or normalized in accepted or (expected and normalized == expected):
+            ACTIVE_RIDDLES.pop(key, None)
+            await message.reply("✅ Correct! Well done! 🎉")
+        else:
+            ACTIVE_RIDDLES.pop(key, None)
+            await message.reply(f"❌ Not quite! The correct answer was {answer}. Try /riddle for another one. 🧩")
+        return
+
+    # Group AI responds when Anonymous is mentioned or someone replies to the bot.
+    if message.chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
+        return
+    is_mention = "anonymous" in text.lower()
+    replied_to_bot = bool(
+        message.reply_to_message
+        and message.reply_to_message.from_user
+        and message.reply_to_message.from_user.is_bot
+        and message.reply_to_message.from_user.id == (await bot.get_me()).id
+    )
+    if not is_mention and not replied_to_bot:
         return
     prompt = text
-    if "anonymous" in prompt.lower():
-        index = prompt.lower().find("anonymous")
-        prompt = (prompt[:index] + prompt[index + len("anonymous"):]).strip(" ,:!?-\n")
-    if prompt and ai_client is not None:
-        await ask_ai(message, prompt)
-    elif prompt and ai_client is None:
-        await message.reply("🤖 AI is not configured yet. An admin can add OPENAI_API_KEY in Render → Environment.")
+    if is_mention:
+        import re
+        prompt = re.sub(r"(?i)anonymous(?:™)?\s*", "", prompt, count=1).strip(" ,:!?-\n")
+    if not prompt and replied_to_bot:
+        prompt = text
+    if not prompt:
+        await message.reply("🤖 Yes? Ask me anything!")
+        return
+    if ai_client is None:
+        await message.reply("🤖 Gemini AI isn't configured. An admin needs to add GEMINI_API_KEY in Render Environment.")
+        return
+    await ask_ai(message, prompt)
 
 
 async def health_handler(request):
