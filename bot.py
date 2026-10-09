@@ -71,7 +71,7 @@ def back_menu() -> InlineKeyboardMarkup:
 
 
 HELP_TEXT = (
-    "👋 <b>Welcome to Anonymous™ Mini Help!</b>\n\n"
+    "👋 Welcome to Anonymous™ Mini Help!\n\n"
     "I can help with fun commands, quick games, group moderation, and AI chat (when enabled).\n\n"
     "• Use the buttons below to explore.\n"
     "• In groups, reply to a message when using moderation commands.\n"
@@ -80,14 +80,14 @@ HELP_TEXT = (
 )
 
 COMMANDS_TEXT = (
-    "📚 <b>ANONYMOUS™ MINI — COMMAND LIST</b>\n\n"
-    "⚡ <b>Basic</b>\n"
+    "📚 ANONYMOUS™ MINI — COMMAND LIST\n\n"
+    "⚡ Basic\n"
     "/start — Open the main menu\n"
     "/help — Help and usage\n"
     "/commands — Show commands\n"
     "/about — About this bot\n"
     "/ping — Check bot response\n\n"
-    "😂 <b>Fun</b>\n"
+    "😂 Fun\n"
     "/joke — Random joke\n"
     "/fact — Random fact\n"
     "/quote — Motivational quote\n"
@@ -100,16 +100,16 @@ COMMANDS_TEXT = (
     "/riddle — Get a riddle\n"
     "/quiz — Quick multiple-choice quiz\n"
     "/ship @user @user — Fun compatibility score\n\n"
-    "🤖 <b>AI</b>\n"
+    "🤖 AI\n"
     "/ai your question — Ask AI (requires API key)\n"
-    "In groups, mention <code>Anonymous</code> followed by your question.\n\n"
-    "🛡️ <b>Group admins</b>\n"
+    "In groups, mention Anonymous followed by your question.\n\n"
+    "🛡️ Group admins\n"
     "/ban, /unban, /kick, /mute, /unmute, /warn, /warnings\n"
     "Use these in a group and reply to the person’s message."
 )
 
 ABOUT_TEXT = (
-    "👑 <b>Anonymous™ Mini</b>\n\n"
+    "👑 Anonymous™ Mini\n\n"
     "Your personal mini bot — fast, simple, and easy to use.\n\n"
     "✨ Fun commands • Group tools • AI chat\n"
     "🛠️ Created by: @i_amanonymous\n\n"
@@ -217,7 +217,7 @@ async def require_admin(message: Message) -> bool:
 @dp.message(CommandStart())
 async def start(message: Message):
     text = (
-        "👋 <b>Welcome to Anonymous™ Mini!</b>\n\n"
+        "👋 Welcome to Anonymous™ Mini!\n\n"
         "🤖 Your personal mini bot is ready.\n"
         "⚡ Fast • Simple • Easy to use\n\n"
         "👤 Created by: @i_amanonymous\n"
@@ -246,7 +246,7 @@ async def menu_callbacks(callback: CallbackQuery):
     action = callback.data.split(":", 1)[1]
     if action == "home":
         await callback.message.edit_text(
-            "👋 <b>Welcome to Anonymous™ Mini!</b>\n\n"
+            "👋 Welcome to Anonymous™ Mini!\n\n"
             "🤖 Your personal mini bot is ready.\n"
             "⚡ Fast • Simple • Easy to use\n\n"
             "👤 Created by: @i_amanonymous\n"
@@ -284,19 +284,19 @@ async def quote(message: Message):
 
 @dp.message(Command("roll"))
 async def roll(message: Message):
-    await message.answer(f"🎲 You rolled: <b>{random.randint(1, 6)}</b>")
+    await message.answer(f"🎲 You rolled: {random.randint(1, 6)}")
 
 
 @dp.message(Command("coinflip"))
 async def coinflip(message: Message):
-    await message.answer(f"🪙 It's <b>{random.choice(['HEADS', 'TAILS'])}</b>!")
+    await message.answer(f"🪙 It's {random.choice(['HEADS', 'TAILS'])}!")
 
 
 @dp.message(Command("magic8", "8ball"))
 async def eightball(message: Message):
     question = message.text.partition(" ")[2].strip() if message.text else ""
     if not question:
-        await message.answer("🎱 Ask a question, e.g. <code>/8ball Will I win?</code>")
+        await message.answer("🎱 Ask a question, e.g. /8ball Will I win?")
         return
     await message.answer(random.choice(EIGHT_BALL))
 
@@ -308,18 +308,18 @@ async def compliment(message: Message):
 
 @dp.message(Command("truth"))
 async def truth(message: Message):
-    await message.answer("🫣 <b>TRUTH:</b> " + random.choice(TRUTHS))
+    await message.answer("🫣 TRUTH: " + random.choice(TRUTHS))
 
 
 @dp.message(Command("dare"))
 async def dare(message: Message):
-    await message.answer("🔥 <b>DARE:</b> " + random.choice(DARES))
+    await message.answer("🔥 DARE: " + random.choice(DARES))
 
 
 @dp.message(Command("riddle"))
 async def riddle(message: Message):
     question, answer = random.choice(RIDDLES)
-    await message.answer(f"🧩 <b>RIDDLE:</b> {question}\n\nReply with your guess! (Answer: <tg-spoiler>{answer}</tg-spoiler>)")
+    await message.answer(f"🧩 RIDDLE: {question}\n\nReply with your guess! (Answer: {answer})")
 
 
 @dp.message(Command("quiz"))
@@ -329,7 +329,7 @@ async def quiz(message: Message):
         [InlineKeyboardButton(text=option, callback_data=f"quiz:{correct}:{i}:{option}")]
         for i, option in enumerate(options)
     ])
-    await message.answer("🧠 <b>QUICK QUIZ</b>\n\n" + question, reply_markup=keyboard)
+    await message.answer("🧠 QUICK QUIZ\n\n" + question, reply_markup=keyboard)
 
 
 @dp.callback_query(F.data.startswith("quiz:"))
@@ -338,9 +338,9 @@ async def quiz_answer(callback: CallbackQuery):
         _, correct_s, chosen_s, option = callback.data.split(":", 3)
         correct, chosen = int(correct_s), int(chosen_s)
         if chosen == correct:
-            await callback.message.edit_text(f"✅ Correct! <b>{option}</b> — you earned 10,000 fun coins in spirit! 🪙")
+            await callback.message.edit_text(f"✅ Correct! {option} — you earned 10,000 fun coins in spirit! 🪙")
         else:
-            await callback.message.edit_text(f"❌ Not quite! You chose <b>{option}</b>. Try another /quiz.")
+            await callback.message.edit_text(f"❌ Not quite! You chose {option}. Try another /quiz.")
     except Exception:
         await callback.answer("This quiz has expired.", show_alert=True)
         return
@@ -352,18 +352,18 @@ async def ship(message: Message):
     parts = (message.text or "").split()
     names = [p for p in parts[1:] if p.startswith("@")]
     if len(names) < 2:
-        await message.answer("💞 Usage: <code>/ship @person1 @person2</code>")
+        await message.answer("💞 Usage: /ship @person1 @person2")
         return
     score = random.randint(0, 100)
     emoji = "💖" if score >= 75 else ("💛" if score >= 40 else "💔")
-    await message.answer(f"💘 Compatibility for {names[0]} + {names[1]}: <b>{score}%</b> {emoji}\n(Just for fun!)")
+    await message.answer(f"💘 Compatibility for {names[0]} + {names[1]}: {score}% {emoji}\n(Just for fun!)")
 
 
 @dp.message(Command("ai"))
 async def ai_command(message: Message):
     prompt = (message.text or "").partition(" ")[2].strip()
     if not prompt:
-        await message.answer("🤖 Ask me something: <code>/ai explain black holes simply</code>")
+        await message.answer("🤖 Ask me something: /ai explain black holes simply")
         return
     if ai_client is None:
         await message.answer("⚠️ AI is not configured yet. Add OPENAI_API_KEY in Render → Environment to enable it.")
@@ -387,9 +387,19 @@ async def ask_ai(message: Message, prompt: str):
         if len(answer) > 4000:
             answer = answer[:3900] + "\n\n…(message shortened)"
         await message.reply(answer)
-    except Exception:
+    except Exception as exc:
         log.exception("AI request failed")
-        await message.reply("⚠️ AI couldn't answer just now. Please try again later.")
+        # Give a useful hint without exposing secret keys or internal API details.
+        error_name = type(exc).__name__.lower()
+        if "authentication" in error_name or "permission" in error_name:
+            reply = "⚠️ The AI key was rejected. Check OPENAI_API_KEY in Render → Environment."
+        elif "rate" in error_name or "quota" in str(exc).lower() or "billing" in str(exc).lower():
+            reply = "⚠️ The AI service has reached a usage limit. Check your OpenAI API billing and usage."
+        elif "model" in str(exc).lower():
+            reply = "⚠️ The selected AI model may not be available. Check OPENAI_MODEL in Render → Environment, or remove it to use the default model."
+        else:
+            reply = "⚠️ AI request failed. Check Render → Logs for the exact error, and verify OPENAI_API_KEY and API billing."
+        await message.reply(reply)
 
 
 # Reply-based group moderation commands.
@@ -400,9 +410,9 @@ async def ban_command(message: Message):
     if not target: return
     try:
         await bot.ban_chat_member(message.chat.id, target.id)
-        await message.answer(f"🔨 Banned <a href=\"tg://user?id={target.id}\">{target.full_name}</a>.")
+        await message.answer(f"🔨 Banned <a href=\"tg://user?id={target.id}\">{target.full_name}.")
     except Exception as e:
-        await message.answer(f"❌ I couldn't ban that user. Check my admin permissions.\n<code>{type(e).__name__}</code>")
+        await message.answer(f"❌ I couldn't ban that user. Check my admin permissions.\n{type(e).__name__}")
 
 
 @dp.message(Command("unban"))
@@ -486,7 +496,7 @@ async def warn_command(message: Message):
         except Exception:
             await message.answer(f"⚠️ {target.full_name} has {count}/3 warnings. I couldn't kick them; check my admin permissions.")
     else:
-        await message.answer(f"⚠️ Warned {target.full_name}: <b>{count}/3</b>. Three warnings trigger a kick.")
+        await message.answer(f"⚠️ Warned {target.full_name}: {count}/3. Three warnings trigger a kick.")
 
 
 @dp.message(Command("warnings"))
@@ -494,7 +504,7 @@ async def warnings_command(message: Message):
     target = await replied_target(message)
     if not target: return
     count = WARNINGS.get((message.chat.id, target.id), 0)
-    await message.answer(f"⚠️ {target.full_name} has <b>{count}/3</b> warning(s) in this running session.")
+    await message.answer(f"⚠️ {target.full_name} has {count}/3 warning(s) in this running session.")
 
 
 @dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}), F.text)
