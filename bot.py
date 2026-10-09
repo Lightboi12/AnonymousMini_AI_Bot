@@ -665,14 +665,27 @@ async def warnings_command(message: Message):
     F.text
     & (
         F.text.lower().contains("who is your founder")
+        | F.text.lower().contains("who is ur founder")
         | F.text.lower().contains("who's your founder")
+        | F.text.lower().contains("who's ur founder")
         | F.text.lower().contains("who is your creator")
+        | F.text.lower().contains("who is ur creator")
         | F.text.lower().contains("who created you")
+        | F.text.lower().contains("who created u")
         | F.text.lower().contains("who made you")
+        | F.text.lower().contains("who made u")
         | F.text.lower().contains("who owns you")
+        | F.text.lower().contains("who owns u")
         | F.text.lower().contains("who is your owner")
+        | F.text.lower().contains("who is ur owner")
+        | F.text.lower().contains("who built you")
+        | F.text.lower().contains("who built u")
+        | F.text.lower().contains("who owns you")
+        | F.text.lower().contains("who owns u")
+        | F.text.lower().contains("who is your dev")
+        | F.text.lower().contains("who is ur dev")
     )
-)
+    )
 async def founder_handler(message: Message):
     await message.answer(
         FOUNDER_REPLY,
