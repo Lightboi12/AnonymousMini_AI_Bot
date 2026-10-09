@@ -15,7 +15,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 
 # Anonymous™ Mini — refreshed menu, fun commands, and optional AI.
 # Required Render environment variable: TOKEN
-# Optional: OPENAI_API_KEY
+# Optional: GEMINI_API_KEY
 # This app uses long polling plus a small HTTP health endpoint for Render.
 
 logging.basicConfig(
@@ -25,7 +25,7 @@ logging.basicConfig(
 log = logging.getLogger("anonymous-mini")
 
 TOKEN = os.getenv("TOKEN", "").strip()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 PORT = int(os.getenv("PORT", "10000"))
 
 if not TOKEN:
@@ -37,12 +37,12 @@ started_at = time.time()
 bot_username = ""
 ai_client = None
 
-if OPENAI_API_KEY:
+if GEMINI_API_KEY:
     try:
-        from openai import AsyncOpenAI
-        ai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+        from google import genai
+        ai_client = genai.Client(api_key=GEMINI_API_KEY)
     except Exception:
-        log.exception("OpenAI client could not be initialized. AI commands will be unavailable.")
+        log.exception("Gemini client could not be initialized.")
 
 
 def main_menu() -> InlineKeyboardMarkup:
