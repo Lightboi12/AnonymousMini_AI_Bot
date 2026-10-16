@@ -31,6 +31,9 @@ log = logging.getLogger("anonymous-mini")
 
 TOKEN = os.getenv("TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY", "").strip()
 PORT = int(os.getenv("PORT", "10000"))
 
 
@@ -224,7 +227,7 @@ HELP_TEXT = (
     "• Use the buttons below to explore.\n"
     "• In groups, reply to a message when using moderation commands.\n"
     "• Group moderation commands generally require admin permissions.\n"
-    "• AI requires GEMINI_API_KEY in Render Environment.\n• Conversation history and saved facts are stored separately per user and chat."
+    "• AI works with any configured OpenRouter, Groq, Gemini, or Cerebras API key.\n• Conversation history and saved facts are stored separately per user and chat."
 )
 
 COMMANDS_TEXT = (
@@ -517,15 +520,48 @@ async def ai_command(message: Message):
     if not prompt:
         await message.answer("🤖 Ask me something: /ai explain black holes simply")
         return
-    if ai_client is None:
-        await message.answer("⚠️ Gemini AI isn't configured. Add GEMINI_API_KEY in Render → Environment.")
+    if not any([GEMINI_API_KEY, OPENROUTER_API_KEY, GROQ_API_KEY, CEREBRAS_API_KEY]):
+        await message.answer("⚠️ No AI provider is configured. Add at least one AI API key in Render → Environment.")
         return
     await ask_ai(message, prompt)
 
 
+async def _chat_completion(provider: str, api_key: str, model: str, conversation: str) -> str:
+    """Call a chat-completions provider using its OpenAI-compatible API."""
+    import aiohttp
+
+    endpoints = {
+        "OpenRouter": "https://openrouter.ai/api/v1/chat/completions",
+        "Groq": "https://api.groq.com/openai/v1/chat/completions",
+        "Cerebras": "https://api.cerebras.ai/v1/chat/completions",
+    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    if provider == "OpenRouter":
+        headers["HTTP-Referer"] = "https://t.me/"
+        headers["X-Title"] = "Anonymous Mini"
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": conversation}],
+        "temperature": 0.7,
+    }
+    timeout = aiohttp.ClientTimeout(total=45)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(endpoints[provider], headers=headers, json=payload) as response:
+            body = await response.text()
+            if response.status >= 400:
+                # Include provider response in logs, but never expose API keys.
+                raise RuntimeError(f"{provider} HTTP {response.status}: {body[:700]}")
+            try:
+                data = await response.json(content_type=None)
+                return (data.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+            except Exception as exc:
+                raise RuntimeError(f"{provider} returned an unreadable response: {body[:300]}") from exc
+
+
 async def ask_ai(message: Message, prompt: str):
-    if ai_client is None:
-        await message.reply("⚠️ Gemini AI isn't configured. Add GEMINI_API_KEY in Render → Environment.")
+    configured = any([GEMINI_API_KEY, OPENROUTER_API_KEY, GROQ_API_KEY, CEREBRAS_API_KEY])
+    if not configured:
+        await message.reply("⚠️ No AI provider is configured. Add at least one AI API key in Render → Environment.")
         return
 
     user_id = message.from_user.id if message.from_user else 0
@@ -533,12 +569,7 @@ async def ask_ai(message: Message, prompt: str):
     extract_memory_facts(chat_id, user_id, prompt)
     history = load_history(chat_id, user_id)
     memories = load_memories(chat_id, user_id)
-    primary_model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash").strip()
-    fallback_model = os.getenv("GEMINI_FALLBACK_MODEL", "").strip()
-    models = [primary_model]
-    if fallback_model and fallback_model != primary_model:
-        models.append(fallback_model)
-    log.info("Gemini models selected for this request: %s", models)
+
     system_instruction = (
         "You are Anonymous™ Mini, a smart, warm, witty, natural conversational AI in Telegram. "
         "Talk like a normal person, not a customer-support script. Use the conversation history and saved facts "
@@ -559,40 +590,49 @@ async def ask_ai(message: Message, prompt: str):
     context.append("New user message: " + prompt)
     conversation = "\n\n".join(context)
 
-    last_error = None
-    for index, model_name in enumerate(models):
+    # Each configured provider is tried once in sequence. A quota/rate-limit,
+    # auth, model, or temporary failure advances to the next provider.
+    providers = []
+    if OPENROUTER_API_KEY:
+        providers.append(("OpenRouter", OPENROUTER_API_KEY,
+                          os.getenv("OPENROUTER_MODEL", "openai/gpt-oss-20b").strip()))
+    if GROQ_API_KEY:
+        providers.append(("Groq", GROQ_API_KEY,
+                          os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip()))
+    if GEMINI_API_KEY and ai_client is not None:
+        providers.append(("Gemini", GEMINI_API_KEY,
+                          os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()))
+    if CEREBRAS_API_KEY:
+        providers.append(("Cerebras", CEREBRAS_API_KEY,
+                          os.getenv("CEREBRAS_MODEL", "llama-3.3-70b").strip()))
+
+    errors = []
+    for provider, api_key, model in providers:
         try:
+            log.info("Trying AI provider %s (model %s)", provider, model)
             async with ChatActionSender(bot=bot, chat_id=chat_id, action="typing"):
-                response = await ai_client.aio.models.generate_content(model=model_name, contents=conversation)
-            answer = (getattr(response, "text", None) or "").strip()
+                if provider == "Gemini":
+                    response = await ai_client.aio.models.generate_content(model=model, contents=conversation)
+                    answer = (getattr(response, "text", None) or "").strip()
+                else:
+                    answer = await _chat_completion(provider, api_key, model, conversation)
             if not answer:
-                answer = "Hmm, I couldn't put that into words just now. Try asking me again."
+                raise RuntimeError(f"{provider} returned an empty answer")
             if len(answer) > 4000:
                 answer = answer[:3900] + "\n\n…(message shortened)"
             await message.reply(answer)
             save_history_turn(chat_id, user_id, prompt, answer)
+            log.info("AI response succeeded with %s", provider)
             return
         except Exception as exc:
-            last_error = exc
-            detail = str(exc).lower()
-            is_quota_error = ("quota" in detail or "resource_exhausted" in detail or "rate limit" in detail or "429" in detail)
-            if is_quota_error and index < len(models) - 1:
-                log.warning("Gemini model %s hit quota/rate limit; trying %s", model_name, models[index + 1])
-                continue
-            log.exception("Gemini AI request failed using model %s", model_name)
-            if "api key" in detail or "permission" in detail or "auth" in type(exc).__name__.lower():
-                reply = "⚠️ Gemini rejected the API key. Check GEMINI_API_KEY in Render Environment."
-            elif is_quota_error:
-                reply = "⚠️ Gemini quota is exhausted for the configured models. Check Google AI Studio usage or try later."
-            elif "model" in detail or "not found" in detail:
-                reply = f"⚠️ Gemini model '{model_name}' isn't available for this key. Check GEMINI_MODEL."
-            else:
-                reply = "⚠️ Gemini couldn't answer just now. Check the latest Render logs for details."
-            await message.reply(reply)
-            return
-    if last_error:
-        log.error("All configured Gemini models failed: %s", last_error)
-        await message.reply("⚠️ Gemini couldn't answer right now. Please try again later.")
+            errors.append(f"{provider}: {exc}")
+            log.warning("AI provider %s failed; trying next provider. Error: %s", provider, exc)
+
+    log.error("All configured AI providers failed: %s", " | ".join(errors))
+    await message.reply(
+        "⚠️ All configured AI providers are temporarily unavailable or have reached their limits. "
+        "Please try again later."
+    )
 
 
 @dp.message(Command("memory"))
