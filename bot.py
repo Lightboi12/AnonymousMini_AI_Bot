@@ -2,22 +2,25 @@ import asyncio
 import logging
 import os
 import random
-import re
 import time
+import sqlite3
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from html import escape
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ChatType
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    BotCommand
+    ChatMember, BotCommand, ChatPermissions
 )
-from openai import AsyncOpenAI
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.utils.chat_action import ChatActionSender
 
-# Anonymous™ Mini — multi-AI fallback, fun commands, and group moderation.
+# Anonymous™ Mini — refreshed menu, fun commands, and optional AI.
 # Required Render environment variable: TOKEN
-# Optional AI environment variables:
-# GEMINI_API_KEY, GROQ_API_KEY, OPENROUTER_API_KEY, CEREBRAS_API_KEY
+# Optional: GEMINI_API_KEY
 # This app uses long polling plus a small HTTP health endpoint for Render.
 
 logging.basicConfig(
@@ -28,10 +31,8 @@ log = logging.getLogger("anonymous-mini")
 
 TOKEN = os.getenv("TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
-CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY", "").strip()
 PORT = int(os.getenv("PORT", "10000"))
+
 
 # Founder identity: the displayed name is clickable and opens the Telegram profile.
 FOUNDER_NAME = "𝐋 𝐎 𝐑 𝐃 ♰ 𝐀𝐍𝐎𝐍𝐘𝐌𝐎𝐔𝐒™"
@@ -42,62 +43,155 @@ FOUNDER_REPLY = (
 )
 
 if not TOKEN:
-    raise RuntimeError(
-        "Missing TOKEN environment variable. Add your Telegram bot token in Render → Environment."
-    )
+    raise RuntimeError("Missing TOKEN environment variable. Add your Telegram bot token in Render → Environment.")
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 started_at = time.time()
 bot_username = ""
-
-# AI providers are optional. Add any provider API key in Render Environment.
-AI_PROVIDERS = []
+ai_client = None
 
 if GEMINI_API_KEY:
     try:
         from google import genai
-        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-        AI_PROVIDERS.append(("Gemini", "gemini", gemini_client))
+        ai_client = genai.Client(api_key=GEMINI_API_KEY)
     except Exception:
-        log.exception("Gemini client could not be initialized.")
-
-if GROQ_API_KEY:
-    AI_PROVIDERS.append((
-        "Groq", "openai",
-        AsyncOpenAI(
-            api_key=GROQ_API_KEY,
-            base_url="https://api.groq.com/openai/v1",
-            timeout=35.0,
-            max_retries=0,
-        )
-    ))
-
-if OPENROUTER_API_KEY:
-    AI_PROVIDERS.append((
-        "OpenRouter", "openai",
-        AsyncOpenAI(
-            api_key=OPENROUTER_API_KEY,
-            base_url="https://openrouter.ai/api/v1",
-            timeout=35.0,
-            max_retries=0,
-            default_headers={"X-OpenRouter-Title": "Anonymous Mini"},
-        )
-    ))
-
-if CEREBRAS_API_KEY:
-    AI_PROVIDERS.append((
-        "Cerebras", "openai",
-        AsyncOpenAI(
-            api_key=CEREBRAS_API_KEY,
-            base_url="https://api.cerebras.ai/v1",
-            timeout=35.0,
-            max_retries=0,
-        )
-    ))
+        log.exception("Gemini client could not be initialized. AI commands will be unavailable.")
 
 # Active riddles are kept per chat and user while this process is running.
 ACTIVE_RIDDLES = {}
+# Short-lived conversational context, kept separately for each user in each chat.
+AI_HISTORY = {}  # compatibility cache; persistent SQLite is the source of truth.
+AI_HISTORY_TURNS = 12
+MEMORY_DB_PATH = os.getenv(
+    "MEMORY_DB_PATH",
+    "/var/data/anonymous_memory.sqlite3" if os.path.isdir("/var/data") else "anonymous_memory.sqlite3",
+)
+
+
+def db_connect():
+    connection = sqlite3.connect(MEMORY_DB_PATH, timeout=15)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+@contextmanager
+def db_session():
+    connection = db_connect()
+    try:
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def init_database():
+    parent = os.path.dirname(os.path.abspath(MEMORY_DB_PATH))
+    os.makedirs(parent, exist_ok=True)
+    with db_session() as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("""CREATE TABLE IF NOT EXISTS chat_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+            role TEXT NOT NULL, content TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_history_chat_user ON chat_history(chat_id, user_id, id)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS user_memories (
+            chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+            fact TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(chat_id, user_id, fact)
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS warnings (
+            chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL, count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(chat_id, user_id)
+        )""")
+
+
+def load_history(chat_id: int, user_id: int, limit: int = 24):
+    with db_session() as conn:
+        rows = conn.execute(
+            "SELECT role, content FROM chat_history WHERE chat_id=? AND user_id=? ORDER BY id DESC LIMIT ?",
+            (chat_id, user_id, limit),
+        ).fetchall()
+    return [(row["role"], row["content"]) for row in reversed(rows)]
+
+
+def save_history_turn(chat_id: int, user_id: int, prompt: str, answer: str):
+    with db_session() as conn:
+        conn.executemany(
+            "INSERT INTO chat_history(chat_id,user_id,role,content) VALUES(?,?,?,?)",
+            [(chat_id, user_id, "user", prompt[:6000]), (chat_id, user_id, "assistant", answer[:6000])],
+        )
+        # Keep the most recent 200 messages per chat/user; long-term facts are stored separately.
+        conn.execute("""DELETE FROM chat_history WHERE chat_id=? AND user_id=? AND id NOT IN
+            (SELECT id FROM chat_history WHERE chat_id=? AND user_id=? ORDER BY id DESC LIMIT 200)""",
+            (chat_id, user_id, chat_id, user_id))
+
+
+def extract_memory_facts(chat_id: int, user_id: int, text: str):
+    """Store a few explicit, low-risk self-descriptions without making guesses."""
+    import re
+    patterns = [
+        r"\bmy name is ([^.!?\n]{1,60})",
+        r"\bcall me ([^.!?\n]{1,60})",
+        r"\bi am from ([^.!?\n]{1,80})",
+        r"\bi'm from ([^.!?\n]{1,80})",
+        r"\bi study ([^.!?\n]{1,100})",
+        r"\bi am learning ([^.!?\n]{1,100})",
+        r"\bi'm learning ([^.!?\n]{1,100})",
+        r"\bi work as ([^.!?\n]{1,100})",
+        r"\bi like ([^.!?\n]{1,100})",
+        r"\bi love ([^.!?\n]{1,100})",
+        r"\bmy project is ([^.!?\n]{1,100})",
+    ]
+    lower = text.strip()
+    facts = []
+    for pattern in patterns:
+        match = re.search(pattern, lower, flags=re.IGNORECASE)
+        if match:
+            value = match.group(1).strip(" ,;:")
+            if value and len(value) <= 100:
+                facts.append(text.strip()[:160])
+                break
+    if facts:
+        with db_session() as conn:
+            for fact in facts:
+                conn.execute(
+                    "INSERT OR IGNORE INTO user_memories(chat_id,user_id,fact) VALUES(?,?,?)",
+                    (chat_id, user_id, fact),
+                )
+            # Limit saved facts so stale context cannot grow forever.
+            conn.execute("""DELETE FROM user_memories WHERE rowid IN (
+                SELECT rowid FROM user_memories WHERE chat_id=? AND user_id=?
+                ORDER BY rowid DESC LIMIT -1 OFFSET 40)""", (chat_id, user_id))
+
+
+def load_memories(chat_id: int, user_id: int):
+    with db_session() as conn:
+        rows = conn.execute(
+            "SELECT fact FROM user_memories WHERE chat_id=? AND user_id=? ORDER BY rowid DESC LIMIT 40",
+            (chat_id, user_id),
+        ).fetchall()
+    return [row["fact"] for row in reversed(rows)]
+
+
+def warning_count(chat_id: int, user_id: int) -> int:
+    with db_session() as conn:
+        row = conn.execute("SELECT count FROM warnings WHERE chat_id=? AND user_id=?", (chat_id, user_id)).fetchone()
+    return int(row["count"]) if row else 0
+
+
+def set_warning_count(chat_id: int, user_id: int, count: int):
+    with db_session() as conn:
+        if count <= 0:
+            conn.execute("DELETE FROM warnings WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+        else:
+            conn.execute("INSERT INTO warnings(chat_id,user_id,count) VALUES(?,?,?) ON CONFLICT(chat_id,user_id) DO UPDATE SET count=excluded.count", (chat_id, user_id, count))
+
 
 def main_menu() -> InlineKeyboardMarkup:
     add_group_url = f"https://t.me/{bot_username}?startgroup=true" if bot_username else "https://t.me/"
@@ -118,10 +212,8 @@ def back_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🏠 Main Menu", callback_data="menu:home")],
         [
             InlineKeyboardButton(text="📚 Commands", callback_data="menu:commands"),
-            InlineKeyboardButton(
-                text="➕ Add to Group",
-                url=f"https://t.me/{bot_username}?startgroup=true" if bot_username else "https://t.me/"
-            ),
+            InlineKeyboardButton(text="➕ Add to Group",
+                                 url=f"https://t.me/{bot_username}?startgroup=true" if bot_username else "https://t.me/"),
         ],
     ])
 
@@ -132,8 +224,7 @@ HELP_TEXT = (
     "• Use the buttons below to explore.\n"
     "• In groups, reply to a message when using moderation commands.\n"
     "• Group moderation commands generally require admin permissions.\n"
-    "• AI works when at least one provider API key is added in Render Environment.\n"
-    "• If one AI provider reaches its limit, I try the next configured provider."
+    "• AI requires GEMINI_API_KEY in Render Environment.\n• Conversation history and saved facts are stored separately per user and chat."
 )
 
 COMMANDS_TEXT = (
@@ -158,17 +249,20 @@ COMMANDS_TEXT = (
     "/quiz — Quick multiple-choice quiz\n"
     "/ship @user @user — Fun compatibility score\n\n"
     "🤖 AI\n"
-    "/ai your question — Ask AI (requires at least one API key)\n"
-    "In groups, mention Anonymous followed by your question.\n\n"
-    "🛡️ Group admins\n"
-    "/ban, /unban, /kick, /mute, /unmute, /warn, /warnings\n"
-    "Use these in a group and reply to the person's message."
+    "/ai your question — Ask AI (requires API key)\n"
+    "/memory — View saved facts for this chat\n"
+    "/forgetme — Delete your AI history and memories here\n\n"
+    "🛡️ Group admins (reply to a user's message unless stated)\n"
+    "/ban, /unban USER_ID, /kick, /mute [minutes], /unmute\n"
+    "/warn, /warnings, /resetwarnings, /promote, /demote\n"
+    "/pin, /unpin, /del, /purge [1-50], /close, /open, /adminlist, /id\n"
+    "Bot must be an admin with the required permissions."
 )
 
 ABOUT_TEXT = (
     "👑 Anonymous™ Mini\n\n"
     "Your personal mini bot — fast, simple, and easy to use.\n\n"
-    "✨ Fun commands • Group tools • Multi-AI chat\n"
+    "✨ Fun commands • Group tools • AI chat\n"
     "🛠️ Created by: @i_amanonymous\n\n"
     "Use the menu buttons to explore, or add me to your group."
 )
@@ -233,30 +327,6 @@ EIGHT_BALL = [
     "🎱 The signs point to yes.", "🎱 Better not tell you now.",
     "🎱 Very doubtful.", "🎱 It is possible.", "🎱 Focus and try again."
 ]
-
-# No-repeat decks: each item is used once before that category starts a new round.
-# This prevents jokes, riddles, and quotes from repeating until their lists cycle through.
-_NO_REPEAT_DECKS = {}
-
-def pick_without_repeat(category: str, items: list):
-    if not items:
-        raise ValueError(f"No items available for category: {category}")
-
-    deck = _NO_REPEAT_DECKS.get(category, [])
-    # Rebuild when the deck is empty or the source list has changed.
-    if not deck:
-        deck = list(items)
-        random.shuffle(deck)
-
-        # Avoid repeating the previous round's last item as the first item of a new round.
-        previous = _NO_REPEAT_DECKS.get(f"{category}:last")
-        if len(deck) > 1 and deck[-1] == previous:
-            deck[0], deck[-1] = deck[-1], deck[0]
-
-    chosen = deck.pop()
-    _NO_REPEAT_DECKS[category] = deck
-    _NO_REPEAT_DECKS[f"{category}:last"] = chosen
-    return chosen
 
 WARNINGS = {}  # In-memory warning counts; they reset if the service restarts.
 MUTE_MINUTES_DEFAULT = 10
@@ -350,7 +420,7 @@ async def ping(message: Message):
 
 @dp.message(Command("joke"))
 async def joke(message: Message):
-    await message.answer(pick_without_repeat("jokes", JOKES))
+    await message.answer(random.choice(JOKES))
 
 
 @dp.message(Command("fact"))
@@ -360,7 +430,7 @@ async def fact(message: Message):
 
 @dp.message(Command("quote"))
 async def quote(message: Message):
-    await message.answer(pick_without_repeat("quotes", QUOTES))
+    await message.answer(random.choice(QUOTES))
 
 
 @dp.message(Command("roll"))
@@ -399,11 +469,9 @@ async def dare(message: Message):
 
 @dp.message(Command("riddle"))
 async def riddle(message: Message):
-    question, answer = pick_without_repeat("riddles", RIDDLES)
+    question, answer = random.choice(RIDDLES)
     ACTIVE_RIDDLES[(message.chat.id, message.from_user.id)] = (question, answer)
-    await message.answer(
-        f"🧩 RIDDLE: {question}\n\nReply with your guess! I'll tell you whether you're right. 🤔"
-    )
+    await message.answer(f"🧩 RIDDLE: {question}\n\nReply with your guess! I'll tell you whether you're right. 🤔")
 
 
 @dp.message(Command("quiz"))
@@ -422,13 +490,9 @@ async def quiz_answer(callback: CallbackQuery):
         _, correct_s, chosen_s, option = callback.data.split(":", 3)
         correct, chosen = int(correct_s), int(chosen_s)
         if chosen == correct:
-            await callback.message.edit_text(
-                f"✅ Correct! {option} — you earned 10,000 fun coins in spirit! 🪙"
-            )
+            await callback.message.edit_text(f"✅ Correct! {option} — you earned 10,000 fun coins in spirit! 🪙")
         else:
-            await callback.message.edit_text(
-                f"❌ Not quite! You chose {option}. Try another /quiz."
-            )
+            await callback.message.edit_text(f"❌ Not quite! You chose {option}. Try another /quiz.")
     except Exception:
         await callback.answer("This quiz has expired.", show_alert=True)
         return
@@ -444,9 +508,7 @@ async def ship(message: Message):
         return
     score = random.randint(0, 100)
     emoji = "💖" if score >= 75 else ("💛" if score >= 40 else "💔")
-    await message.answer(
-        f"💘 Compatibility for {names[0]} + {names[1]}: {score}% {emoji}\n(Just for fun!)"
-    )
+    await message.answer(f"💘 Compatibility for {names[0]} + {names[1]}: {score}% {emoji}\n(Just for fun!)")
 
 
 @dp.message(Command("ai"))
@@ -455,237 +517,385 @@ async def ai_command(message: Message):
     if not prompt:
         await message.answer("🤖 Ask me something: /ai explain black holes simply")
         return
-    if not AI_PROVIDERS:
-        await message.answer(
-            "⚠️ No AI provider is configured. Add at least one API key in Render → Environment."
-        )
+    if ai_client is None:
+        await message.answer("⚠️ Gemini AI isn't configured. Add GEMINI_API_KEY in Render → Environment.")
         return
     await ask_ai(message, prompt)
 
 
 async def ask_ai(message: Message, prompt: str):
-    """Try configured AI providers one by one until one returns a usable answer."""
-    system_prompt = (
-        "You are Anonymous™ Mini, a friendly, concise Telegram assistant. "
-        "Answer helpfully and naturally. Do not output HTML tags."
+    if ai_client is None:
+        await message.reply("⚠️ Gemini AI isn't configured. Add GEMINI_API_KEY in Render → Environment.")
+        return
+
+    user_id = message.from_user.id if message.from_user else 0
+    chat_id = message.chat.id
+    extract_memory_facts(chat_id, user_id, prompt)
+    history = load_history(chat_id, user_id)
+    memories = load_memories(chat_id, user_id)
+    primary_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+    fallback_model = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash-lite").strip()
+    models = [primary_model]
+    if fallback_model and fallback_model != primary_model:
+        models.append(fallback_model)
+
+    system_instruction = (
+        "You are Anonymous™ Mini, a smart, warm, witty, natural conversational AI in Telegram. "
+        "Talk like a normal person, not a customer-support script. Use the conversation history and saved facts "
+        "to understand follow-ups and recall details the user previously shared. Keep each user's context private "
+        "to this chat; never claim to remember details that are not in the provided context. Answer directly and "
+        "match the user's tone and language. Do not routinely end with 'Is there anything else I can help with?' "
+        "Only ask a follow-up when genuinely needed. Do not output HTML tags. "
+        "Your founder is 𝐋 𝐎 𝐑 𝐃 ♰ 𝐀𝐍𝐎𝐍𝐘𝐌𝐎𝐔𝐒™."
     )
-    failures = []
+    context = [system_instruction]
+    if memories:
+        context.append("Saved facts this user explicitly shared in this chat:\n- " + "\n- ".join(memories))
+    if history:
+        context.append("Recent conversation:\n" + "\n".join(
+            ("User: " if role == "user" else "Anonymous™ Mini: ") + content
+            for role, content in history[-(AI_HISTORY_TURNS * 2):]
+        ))
+    context.append("New user message: " + prompt)
+    conversation = "\n\n".join(context)
 
-    for provider_name, provider_type, client in AI_PROVIDERS:
+    last_error = None
+    for index, model_name in enumerate(models):
         try:
-            log.info("Trying AI provider: %s", provider_name)
-
-            if provider_type == "gemini":
-                response = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        client.models.generate_content,
-                        model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
-                        contents=system_prompt + "\n\nUser question: " + prompt,
-                    ),
-                    timeout=35,
-                )
-                answer = (getattr(response, "text", None) or "").strip()
-            else:
-                if provider_name == "Groq":
-                    model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
-                elif provider_name == "OpenRouter":
-                    model = os.getenv("OPENROUTER_MODEL", "openrouter/free")
-                else:
-                    model = os.getenv("CEREBRAS_MODEL", "gpt-oss-120b")
-
-                response = await asyncio.wait_for(
-                    client.chat.completions.create(
-                        model=model,
-                        messages=[
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": prompt},
-                        ],
-                        max_tokens=900,
-                    ),
-                    timeout=40,
-                )
-                answer = (response.choices[0].message.content or "").strip()
-
+            async with ChatActionSender(bot=bot, chat_id=chat_id, action="typing"):
+                response = await ai_client.aio.models.generate_content(model=model_name, contents=conversation)
+            answer = (getattr(response, "text", None) or "").strip()
             if not answer:
-                raise RuntimeError("Provider returned an empty answer.")
-
+                answer = "Hmm, I couldn't put that into words just now. Try asking me again."
             if len(answer) > 4000:
                 answer = answer[:3900] + "\n\n…(message shortened)"
-
-            log.info("AI response succeeded with provider: %s", provider_name)
             await message.reply(answer)
+            save_history_turn(chat_id, user_id, prompt, answer)
             return
-
         except Exception as exc:
-            log.warning(
-                "AI provider %s failed (%s): %s",
-                provider_name, type(exc).__name__, str(exc)[:250]
-            )
-            failures.append(provider_name)
+            last_error = exc
+            detail = str(exc).lower()
+            is_quota_error = ("quota" in detail or "resource_exhausted" in detail or "rate limit" in detail or "429" in detail)
+            if is_quota_error and index < len(models) - 1:
+                log.warning("Gemini model %s hit quota/rate limit; trying %s", model_name, models[index + 1])
+                continue
+            log.exception("Gemini AI request failed using model %s", model_name)
+            if "api key" in detail or "permission" in detail or "auth" in type(exc).__name__.lower():
+                reply = "⚠️ Gemini rejected the API key. Check GEMINI_API_KEY in Render Environment."
+            elif is_quota_error:
+                reply = "⚠️ Gemini quota is exhausted for the configured models. Check Google AI Studio usage or try later."
+            elif "model" in detail or "not found" in detail:
+                reply = f"⚠️ Gemini model '{model_name}' isn't available for this key. Check GEMINI_MODEL."
+            else:
+                reply = "⚠️ Gemini couldn't answer just now. Check the latest Render logs for details."
+            await message.reply(reply)
+            return
+    if last_error:
+        log.error("All configured Gemini models failed: %s", last_error)
+        await message.reply("⚠️ Gemini couldn't answer right now. Please try again later.")
 
-    log.error("All configured AI providers failed: %s", ", ".join(failures))
-    await message.reply(
-        "⚠️ All configured AI providers are busy or unavailable right now. "
-        "Please try again in a little while. If this keeps happening, check the API keys, "
-        "model names, usage limits, and latest Render logs."
-    )
+
+@dp.message(Command("memory"))
+async def memory_command(message: Message):
+    if not message.from_user:
+        return
+    facts = load_memories(message.chat.id, message.from_user.id)
+    if not facts:
+        await message.reply("🧠 I haven't saved any personal facts from this chat yet. Keep chatting naturally.")
+        return
+    await message.reply("🧠 Things I remember from this chat:\n• " + "\n• ".join(facts[-20:]))
 
 
-# Reply-based group moderation commands.
+@dp.message(Command("forgetme"))
+async def forgetme_command(message: Message):
+    if not message.from_user:
+        return
+    with db_session() as conn:
+        conn.execute("DELETE FROM chat_history WHERE chat_id=? AND user_id=?", (message.chat.id, message.from_user.id))
+        conn.execute("DELETE FROM user_memories WHERE chat_id=? AND user_id=?", (message.chat.id, message.from_user.id))
+    AI_HISTORY.pop((message.chat.id, message.from_user.id), None)
+    await message.reply("🧹 Done — I've cleared your saved AI conversation and facts for this chat.")
+
+
+# Group moderation: only actual group admins can invoke these commands.
+async def admin_target(message: Message):
+    target = await replied_target(message)
+    if target and message.from_user and target.id == message.from_user.id:
+        await message.reply("⚠️ You can't use that command on yourself.")
+        return None
+    return target
+
+
 @dp.message(Command("ban"))
 async def ban_command(message: Message):
-    if not await require_admin(message):
-        return
-    target = await replied_target(message)
-    if not target:
-        return
+    if not await require_admin(message): return
+    target = await admin_target(message)
+    if not target: return
     try:
         await bot.ban_chat_member(message.chat.id, target.id)
-        await message.answer(
-            f'🔨 Banned <a href="tg://user?id={target.id}">{target.full_name}</a>.',
-            parse_mode="HTML"
-        )
+        await message.answer(f'🔨 Banned <a href="tg://user?id={target.id}">{escape(target.full_name)}</a>.', parse_mode="HTML")
     except Exception as e:
-        await message.answer(
-            f"❌ I couldn't ban that user. Check my admin permissions.\n{type(e).__name__}"
-        )
+        await message.answer(f"❌ Ban failed. Check that I'm an admin with ban rights. ({type(e).__name__})")
 
 
 @dp.message(Command("unban"))
 async def unban_command(message: Message):
-    if not await require_admin(message):
-        return
-    target = await replied_target(message)
-    if not target:
+    if not await require_admin(message): return
+    args = (message.text or "").split()
+    target_id = None
+    if len(args) > 1 and args[1].lstrip("-").isdigit():
+        target_id = int(args[1])
+    elif message.reply_to_message and message.reply_to_message.from_user:
+        target_id = message.reply_to_message.from_user.id
+    if target_id is None:
+        await message.reply("Usage: /unban USER_ID (or reply to a user's message if available).")
         return
     try:
-        await bot.unban_chat_member(message.chat.id, target.id, only_if_banned=True)
-        await message.answer(f"✅ Unbanned {target.full_name} (if they were banned).")
+        await bot.unban_chat_member(message.chat.id, target_id, only_if_banned=True)
+        await message.answer(f"✅ Unbanned user ID {target_id} (if they were banned).")
     except Exception:
-        await message.answer("❌ I couldn't unban that user. Check my admin permissions.")
+        await message.answer("❌ Unban failed. Check my admin permissions and the user ID.")
 
 
 @dp.message(Command("kick"))
 async def kick_command(message: Message):
-    if not await require_admin(message):
-        return
-    target = await replied_target(message)
-    if not target:
-        return
+    if not await require_admin(message): return
+    target = await admin_target(message)
+    if not target: return
     try:
         await bot.ban_chat_member(message.chat.id, target.id)
         await bot.unban_chat_member(message.chat.id, target.id, only_if_banned=True)
-        await message.answer(f"👢 Kicked {target.full_name}.")
+        await message.answer(f"👢 Kicked {escape(target.full_name)}.")
     except Exception:
-        await message.answer("❌ I couldn't kick that user. Check my admin permissions.")
+        await message.answer("❌ Kick failed. Check my admin permissions.")
 
 
 @dp.message(Command("mute"))
 async def mute_command(message: Message):
-    if not await require_admin(message):
-        return
-    target = await replied_target(message)
-    if not target:
-        return
+    if not await require_admin(message): return
+    target = await admin_target(message)
+    if not target: return
+    args = (message.text or "").split()
+    minutes = MUTE_MINUTES_DEFAULT
+    if len(args) > 1:
+        try: minutes = max(1, min(10080, int(args[1])))
+        except ValueError:
+            await message.reply("Usage: reply with /mute [minutes]. Example: /mute 30")
+            return
     try:
-        from datetime import datetime, timedelta, timezone
-        from aiogram.types import ChatPermissions
-        until = datetime.now(timezone.utc) + timedelta(minutes=MUTE_MINUTES_DEFAULT)
-        await bot.restrict_chat_member(
-            message.chat.id, target.id,
-            permissions=ChatPermissions(can_send_messages=False),
-            until_date=until
-        )
-        await message.answer(f"🔇 Muted {target.full_name} for {MUTE_MINUTES_DEFAULT} minutes.")
+        until = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+        await bot.restrict_chat_member(message.chat.id, target.id, permissions=ChatPermissions(can_send_messages=False), until_date=until)
+        await message.answer(f"🔇 Muted {escape(target.full_name)} for {minutes} minute(s).")
     except Exception:
-        await message.answer("❌ I couldn't mute that user. Check my admin permissions.")
+        await message.answer("❌ Mute failed. Check that I'm an admin with restrict-member rights.")
 
 
 @dp.message(Command("unmute"))
 async def unmute_command(message: Message):
-    if not await require_admin(message):
-        return
-    target = await replied_target(message)
-    if not target:
-        return
+    if not await require_admin(message): return
+    target = await admin_target(message)
+    if not target: return
     try:
-        from aiogram.types import ChatPermissions
-        await bot.restrict_chat_member(
-            message.chat.id, target.id,
-            permissions=ChatPermissions(
-                can_send_messages=True, can_send_audios=True, can_send_documents=True,
-                can_send_photos=True, can_send_videos=True, can_send_video_notes=True,
-                can_send_voice_notes=True, can_send_polls=True, can_send_other_messages=True,
-                can_add_web_page_previews=True
-            )
-        )
-        await message.answer(f"🔊 Unmuted {target.full_name}.")
+        await bot.restrict_chat_member(message.chat.id, target.id, permissions=ChatPermissions(
+            can_send_messages=True, can_send_audios=True, can_send_documents=True, can_send_photos=True,
+            can_send_videos=True, can_send_video_notes=True, can_send_voice_notes=True, can_send_polls=True,
+            can_send_other_messages=True, can_add_web_page_previews=True
+        ))
+        await message.answer(f"🔊 Unmuted {escape(target.full_name)}.")
     except Exception:
-        await message.answer("❌ I couldn't unmute that user. Check my admin permissions.")
+        await message.answer("❌ Unmute failed. Check my admin permissions.")
 
 
 @dp.message(Command("warn"))
 async def warn_command(message: Message):
-    if not await require_admin(message):
-        return
-    target = await replied_target(message)
-    if not target:
-        return
-    key = (message.chat.id, target.id)
-    WARNINGS[key] = WARNINGS.get(key, 0) + 1
-    count = WARNINGS[key]
+    if not await require_admin(message): return
+    target = await admin_target(message)
+    if not target: return
+    count = warning_count(message.chat.id, target.id) + 1
+    set_warning_count(message.chat.id, target.id, count)
+    reason = (message.text or "").partition(" ")[2].strip()
+    suffix = f" Reason: {escape(reason)}" if reason else ""
     if count >= 3:
         try:
             await bot.ban_chat_member(message.chat.id, target.id)
             await bot.unban_chat_member(message.chat.id, target.id, only_if_banned=True)
-            WARNINGS[key] = 0
-            await message.answer(f"🚫 {target.full_name} reached 3 warnings and was kicked.")
+            set_warning_count(message.chat.id, target.id, 0)
+            await message.answer(f"🚫 {escape(target.full_name)} reached 3 warnings and was kicked.{suffix}")
         except Exception:
-            await message.answer(
-                f"⚠️ {target.full_name} has {count}/3 warnings. I couldn't kick them; check my admin permissions."
-            )
+            await message.answer(f"⚠️ {escape(target.full_name)} has {count}/3 warnings, but I couldn't kick them. Check my permissions.")
     else:
-        await message.answer(
-            f"⚠️ Warned {target.full_name}: {count}/3. Three warnings trigger a kick."
-        )
+        await message.answer(f"⚠️ Warned {escape(target.full_name)}: {count}/3.{suffix}")
 
 
 @dp.message(Command("warnings"))
 async def warnings_command(message: Message):
-    target = await replied_target(message)
-    if not target:
-        return
-    count = WARNINGS.get((message.chat.id, target.id), 0)
-    await message.answer(
-        f"⚠️ {target.full_name} has {count}/3 warning(s) in this running session."
-    )
+    if not await require_admin(message): return
+    target = await admin_target(message)
+    if not target: return
+    await message.answer(f"⚠️ {escape(target.full_name)} has {warning_count(message.chat.id, target.id)}/3 warning(s).")
+
+
+@dp.message(Command("resetwarnings"))
+async def resetwarnings_command(message: Message):
+    if not await require_admin(message): return
+    target = await admin_target(message)
+    if not target: return
+    set_warning_count(message.chat.id, target.id, 0)
+    await message.answer(f"✅ Warnings reset for {escape(target.full_name)}.")
+
+
+@dp.message(Command("promote"))
+async def promote_command(message: Message):
+    if not await require_admin(message): return
+    target = await admin_target(message)
+    if not target: return
+    try:
+        await bot.promote_chat_member(message.chat.id, target.id, can_manage_chat=True, can_delete_messages=True,
+            can_manage_video_chats=True, can_restrict_members=True, can_promote_members=False,
+            can_change_info=False, can_invite_users=True, can_pin_messages=True, can_post_stories=False,
+            can_edit_stories=False, can_delete_stories=False)
+        await message.answer(f"👑 Promoted {escape(target.full_name)} with standard moderation rights. Adjust specific rights in Telegram if needed.")
+    except Exception:
+        await message.answer("❌ Promote failed. I need admin status and promote-members permission; Telegram may restrict which rights I can grant.")
+
+
+@dp.message(Command("demote"))
+async def demote_command(message: Message):
+    if not await require_admin(message): return
+    target = await admin_target(message)
+    if not target: return
+    try:
+        await bot.promote_chat_member(message.chat.id, target.id, can_manage_chat=False, can_delete_messages=False,
+            can_manage_video_chats=False, can_restrict_members=False, can_promote_members=False,
+            can_change_info=False, can_invite_users=False, can_pin_messages=False, can_post_stories=False,
+            can_edit_stories=False, can_delete_stories=False)
+        await message.answer(f"⬇️ Demoted {escape(target.full_name)} if Telegram permits this action.")
+    except Exception:
+        await message.answer("❌ Demote failed. Check my promote-members permission and target's admin status.")
+
+
+@dp.message(Command("pin"))
+async def pin_command(message: Message):
+    if not await require_admin(message): return
+    if not message.reply_to_message:
+        await message.reply("Reply to a message with /pin."); return
+    try:
+        await bot.pin_chat_message(message.chat.id, message.reply_to_message.message_id)
+        await message.answer("📌 Message pinned.")
+    except Exception:
+        await message.answer("❌ Pin failed. Check my pin-message permission.")
+
+
+@dp.message(Command("unpin"))
+async def unpin_command(message: Message):
+    if not await require_admin(message): return
+    try:
+        if message.reply_to_message:
+            await bot.unpin_chat_message(message.chat.id, message.reply_to_message.message_id)
+        else:
+            await bot.unpin_chat_message(message.chat.id)
+        await message.answer("📌 Message unpinned.")
+    except Exception:
+        await message.answer("❌ Unpin failed. Check my pin-message permission.")
+
+
+@dp.message(Command("del", "delete"))
+async def delete_command(message: Message):
+    if not await require_admin(message): return
+    if not message.reply_to_message:
+        await message.reply("Reply to a message with /del."); return
+    try:
+        await bot.delete_message(message.chat.id, message.reply_to_message.message_id)
+        try: await message.delete()
+        except Exception: pass
+    except Exception:
+        await message.answer("❌ Delete failed. Check my delete-message permission; old messages may be undeletable.")
+
+
+@dp.message(Command("purge"))
+async def purge_command(message: Message):
+    if not await require_admin(message): return
+    if not message.reply_to_message:
+        await message.reply("Reply to the first message to remove, then use /purge [1-50]."); return
+    args = (message.text or "").split()
+    try: count = max(1, min(50, int(args[1]))) if len(args) > 1 else 10
+    except ValueError:
+        await message.reply("Usage: reply to a message and use /purge [1-50]."); return
+    first_id = message.reply_to_message.message_id
+    deleted = 0
+    for mid in range(first_id, min(first_id + count, message.message_id)):
+        try:
+            await bot.delete_message(message.chat.id, mid); deleted += 1
+        except Exception:
+            pass
+    try: await message.delete()
+    except Exception: pass
+    status = await message.answer(f"🧹 Purge finished: deleted {deleted} message(s).")
+    await asyncio.sleep(4)
+    try: await status.delete()
+    except Exception: pass
+
+
+@dp.message(Command("close", "lock"))
+async def close_command(message: Message):
+    if not await require_admin(message): return
+    try:
+        await bot.set_chat_permissions(message.chat.id, ChatPermissions(can_send_messages=False))
+        await message.answer("🔒 Group chat locked for members.")
+    except Exception:
+        await message.answer("❌ Lock failed. Check my change-chat-permissions rights.")
+
+
+@dp.message(Command("open", "unlock"))
+async def open_command(message: Message):
+    if not await require_admin(message): return
+    try:
+        await bot.set_chat_permissions(message.chat.id, ChatPermissions(
+            can_send_messages=True, can_send_audios=True, can_send_documents=True, can_send_photos=True,
+            can_send_videos=True, can_send_video_notes=True, can_send_voice_notes=True, can_send_polls=True,
+            can_send_other_messages=True, can_add_web_page_previews=True, can_invite_users=True,
+            can_pin_messages=False, can_change_info=False
+        ))
+        await message.answer("🔓 Group chat unlocked. Note: Telegram applies the permissions you set here as group defaults.")
+    except Exception:
+        await message.answer("❌ Unlock failed. Check my change-chat-permissions rights.")
+
+
+@dp.message(Command("adminlist"))
+async def adminlist_command(message: Message):
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply("Use this in a group."); return
+    try:
+        admins = await bot.get_chat_administrators(message.chat.id)
+        lines = [f"• {escape(a.user.full_name)} (@{escape(a.user.username)})" if a.user.username else f"• {escape(a.user.full_name)}" for a in admins]
+        await message.answer("👑 Group admins:\n" + "\n".join(lines))
+    except Exception:
+        await message.answer("❌ Couldn't fetch the admin list.")
+
+
+@dp.message(Command("id"))
+async def id_command(message: Message):
+    lines = [f"Chat ID: {message.chat.id}"]
+    if message.reply_to_message and message.reply_to_message.from_user:
+        u = message.reply_to_message.from_user
+        lines.append(f"User ID: {u.id}")
+    elif message.from_user:
+        lines.append(f"Your user ID: {message.from_user.id}")
+    await message.reply("🆔 " + "\n".join(lines))
 
 
 @dp.message(
     F.text
     & (
         F.text.lower().contains("who is your founder")
-        | F.text.lower().contains("who is ur founder")
         | F.text.lower().contains("who's your founder")
-        | F.text.lower().contains("who's ur founder")
         | F.text.lower().contains("who is your creator")
-        | F.text.lower().contains("who is ur creator")
         | F.text.lower().contains("who created you")
-        | F.text.lower().contains("who created u")
         | F.text.lower().contains("who made you")
-        | F.text.lower().contains("who made u")
         | F.text.lower().contains("who owns you")
-        | F.text.lower().contains("who owns u")
         | F.text.lower().contains("who is your owner")
-        | F.text.lower().contains("who is ur owner")
-        | F.text.lower().contains("who built you")
-        | F.text.lower().contains("who built u")
-        | F.text.lower().contains("who owns you")
-        | F.text.lower().contains("who owns u")
-        | F.text.lower().contains("who is your dev")
-        | F.text.lower().contains("who is ur dev")
     )
-    )
+)
 async def founder_handler(message: Message):
     await message.answer(
         FOUNDER_REPLY,
@@ -706,49 +916,40 @@ async def game_and_group_ai_handler(message: Message):
     if active:
         question, answer = active
         normalized = "".join(ch.lower() for ch in text if ch.isalnum())
+        expected = "".join(ch.lower() for ch in answer.split("🥚")[0].split("🎹")[0].split("🧻")[0].split("🕒")[0].split("🎂")[0] if ch.isalnum())
+        # Compare the main answer words, ignoring punctuation and emoji.
         answer_words = answer.lower().split()
-        accepted = [
-            "".join(ch for ch in word.lower() if ch.isalnum())
-            for word in answer_words
-        ]
+        accepted = ["".join(ch for ch in word.lower() if ch.isalnum()) for word in answer_words]
         accepted_text = "".join(ch for ch in answer.lower() if ch.isalnum())
-        if normalized == accepted_text or normalized in accepted:
+        if normalized == accepted_text or normalized in accepted or (expected and normalized == expected):
             ACTIVE_RIDDLES.pop(key, None)
             await message.reply("✅ Correct! Well done! 🎉")
         else:
             ACTIVE_RIDDLES.pop(key, None)
-            await message.reply(
-                f"❌ Not quite! The correct answer was {answer}. Try /riddle for another one. 🧩"
-            )
+            await message.reply(f"❌ Not quite! The correct answer was {answer}. Try /riddle for another one. 🧩")
         return
 
     # Group AI responds when Anonymous is mentioned or someone replies to the bot.
     if message.chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
         return
-
     is_mention = "anonymous" in text.lower()
-    replied_to_bot = False
-    if message.reply_to_message and message.reply_to_message.from_user:
-        if message.reply_to_message.from_user.is_bot:
-            me = await bot.get_me()
-            replied_to_bot = message.reply_to_message.from_user.id == me.id
-
+    replied_to_bot = bool(
+        message.reply_to_message
+        and message.reply_to_message.from_user
+        and message.reply_to_message.from_user.is_bot
+        and message.reply_to_message.from_user.id == (await bot.get_me()).id
+    )
     if not is_mention and not replied_to_bot:
         return
-
     prompt = text
     if is_mention:
+        import re
         prompt = re.sub(r"(?i)anonymous(?:™)?\s*", "", prompt, count=1).strip(" ,:!?-\n")
     if not prompt and replied_to_bot:
         prompt = text
     if not prompt:
-        await message.reply("🤖 Yes? Ask me anything!")
-        return
-    if not AI_PROVIDERS:
-        await message.reply(
-            "🤖 AI isn't configured yet. An admin needs to add at least one AI provider API key in Render Environment."
-        )
-        return
+        # Treat a bare name call as the start of a natural chat, not a canned reply.
+        prompt = "The user just called your name to get your attention. Reply with a short, natural greeting that invites them to continue, without sounding scripted."
     await ask_ai(message, prompt)
 
 
@@ -757,8 +958,7 @@ async def health_handler(request):
         "status": "ok",
         "service": "Anonymous Mini",
         "uptime_seconds": int(time.time() - started_at),
-        "telegram_bot": "initialized",
-        "ai_providers_configured": [provider[0] for provider in AI_PROVIDERS],
+        "telegram_bot": "initialized"
     })
 
 
@@ -779,8 +979,6 @@ async def main():
     me = await bot.get_me()
     bot_username = me.username or ""
     log.info("Starting @%s", bot_username)
-    log.info("Configured AI providers: %s", [provider[0] for provider in AI_PROVIDERS])
-
     commands = [
         BotCommand(command="start", description="Open the main menu"),
         BotCommand(command="help", description="Get help"),
@@ -798,29 +996,37 @@ async def main():
         BotCommand(command="dare", description="Get a dare"),
         BotCommand(command="riddle", description="Get a riddle"),
         BotCommand(command="quiz", description="Play a quick quiz"),
-        BotCommand(command="ship", description="Check fun compatibility"),
-        BotCommand(command="ai", description="Ask AI"),
+        BotCommand(command="ai", description="Chat with AI"),
+        BotCommand(command="memory", description="View what I remember in this chat"),
+        BotCommand(command="forgetme", description="Clear your AI memory in this chat"),
         BotCommand(command="ban", description="Ban a replied-to user"),
-        BotCommand(command="unban", description="Unban a replied-to user"),
+        BotCommand(command="unban", description="Unban by user ID"),
         BotCommand(command="kick", description="Kick a replied-to user"),
-        BotCommand(command="mute", description="Mute a replied-to user"),
-        BotCommand(command="unmute", description="Unmute a replied-to user"),
-        BotCommand(command="warn", description="Warn a replied-to user"),
-        BotCommand(command="warnings", description="Check warnings"),
+        BotCommand(command="mute", description="Mute a user; optional minutes"),
+        BotCommand(command="unmute", description="Unmute a user"),
+        BotCommand(command="warn", description="Warn a user"),
+        BotCommand(command="warnings", description="Check a user's warnings"),
+        BotCommand(command="resetwarnings", description="Reset a user's warnings"),
+        BotCommand(command="promote", description="Promote a replied-to user"),
+        BotCommand(command="demote", description="Demote a replied-to admin"),
+        BotCommand(command="pin", description="Pin a replied-to message"),
+        BotCommand(command="unpin", description="Unpin a message"),
+        BotCommand(command="del", description="Delete a replied-to message"),
+        BotCommand(command="purge", description="Delete a batch of messages"),
+        BotCommand(command="close", description="Lock group messaging"),
+        BotCommand(command="open", description="Unlock group messaging"),
+        BotCommand(command="adminlist", description="List group admins"),
+        BotCommand(command="id", description="Show chat/user ID"),
     ]
     await bot.set_my_commands(commands)
+    init_database()
+    log.info("Persistent memory database: %s", MEMORY_DB_PATH)
     runner = await start_http_server()
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         await runner.cleanup()
         await bot.session.close()
-        for _, provider_type, client in AI_PROVIDERS:
-            if provider_type == "openai":
-                try:
-                    await client.close()
-                except Exception:
-                    pass
 
 
 if __name__ == "__main__":
