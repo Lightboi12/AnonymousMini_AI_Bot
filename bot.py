@@ -538,7 +538,7 @@ async def ask_ai(message: Message, prompt: str):
     models = [primary_model]
     if fallback_model and fallback_model != primary_model:
         models.append(fallback_model)
-
+    log.info("Gemini models selected for this request: %s", models)
     system_instruction = (
         "You are Anonymous™ Mini, a smart, warm, witty, natural conversational AI in Telegram. "
         "Talk like a normal person, not a customer-support script. Use the conversation history and saved facts "
