@@ -533,8 +533,8 @@ async def ask_ai(message: Message, prompt: str):
     extract_memory_facts(chat_id, user_id, prompt)
     history = load_history(chat_id, user_id)
     memories = load_memories(chat_id, user_id)
-    primary_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
-    fallback_model = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash-lite").strip()
+    primary_model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash").strip()
+    fallback_model = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite").strip()
     models = [primary_model]
     if fallback_model and fallback_model != primary_model:
         models.append(fallback_model)
