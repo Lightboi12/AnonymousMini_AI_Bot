@@ -690,8 +690,10 @@ async def ask_ai(message: Message, prompt: str):
         providers.append(("OpenRouter", "openrouter"))
 
     if not providers:
+        log.error("AI request has no configured provider keys (Gemini/Groq/Cerebras/OpenRouter).")
         await message.reply("⚠️ AI isn't configured. Check your provider API keys in Render Environment.")
         return
+    log.info("AI providers configured for this request: %s", ", ".join(name for name, _ in providers))
 
     timeout_seconds = max(2.0, min(float(os.getenv("AI_PROVIDER_TIMEOUT_SECONDS", "4.5")), 10.0))
     last_error = None
@@ -767,10 +769,19 @@ async def ask_ai(message: Message, prompt: str):
             return
         except Exception as exc:
             last_error = exc
-            log.warning("AI provider %s failed; switching immediately: %s", provider_name, type(exc).__name__)
+            # Include the provider's actual rejection reason in Render logs, but never API keys.
+            detail = str(exc).replace("\n", " ").strip()[:700]
+            for secret_name in ("GEMINI_API_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY", "OPENROUTER_API_KEY"):
+                secret_value = os.getenv(secret_name, "").strip()
+                if secret_value:
+                    detail = detail.replace(secret_value, "[REDACTED]")
+            log.warning("AI provider %s failed (%s); switching immediately. Details: %s",
+                        provider_name, type(exc).__name__, detail or "<no error detail returned>")
             continue
 
-    log.error("All configured AI providers failed; last error: %s", last_error)
+    log.error("All configured AI providers failed; last error type=%s details=%s",
+              type(last_error).__name__ if last_error else "unknown",
+              (str(last_error).replace("\n", " ")[:700] if last_error else "none"))
     await message.reply("⚠️ I'm temporarily busy. Please try again in a moment.")
 
 
@@ -784,6 +795,99 @@ async def unban_command(message: Message):
         await message.answer(f"✅ Unbanned {target.full_name} (if they were banned).")
     except Exception:
         await message.answer("❌ I couldn't unban that user. Check my admin permissions.")
+
+
+@dp.message(Command("promote"))
+async def promote_command(message: Message):
+    """Promote the replied-to group member to a standard moderator."""
+    if not await require_admin(message):
+        return
+    target = await replied_target(message)
+    if not target:
+        return
+    if message.from_user and target.id == message.from_user.id:
+        await message.reply("⚠️ You cannot use /promote on yourself.")
+        return
+    try:
+        await bot.promote_chat_member(
+            chat_id=message.chat.id,
+            user_id=target.id,
+            can_manage_chat=False,
+            can_change_info=False,
+            can_post_messages=False,
+            can_edit_messages=False,
+            can_delete_messages=True,
+            can_manage_video_chats=False,
+            can_restrict_members=True,
+            can_promote_members=False,
+            can_invite_users=True,
+            can_pin_messages=True,
+            can_manage_topics=False,
+            can_post_stories=False,
+            can_edit_stories=False,
+            can_delete_stories=False,
+        )
+        await message.answer(
+            f"✅ Promoted <a href=\"tg://user?id={target.id}\">{html_lib.escape(target.full_name)}</a> to group admin with standard moderation rights.",
+            parse_mode="HTML",
+        )
+    except Exception as exc:
+        detail = getattr(exc, "message", None) or str(exc)
+        await message.answer(
+            "❌ I couldn't promote that member. Make sure I'm an admin with the right to add administrators, "
+            "and that you have permission to manage this member.\n"
+            f"Details: {html_lib.escape(str(detail)[:400])}",
+            parse_mode="HTML",
+        )
+
+
+@dp.message(Command("demote"))
+async def demote_command(message: Message):
+    """Remove admin rights from the replied-to administrator."""
+    if not await require_admin(message):
+        return
+    target = await replied_target(message)
+    if not target:
+        return
+    if message.from_user and target.id == message.from_user.id:
+        await message.reply("⚠️ You cannot use /demote on yourself.")
+        return
+    try:
+        member = await bot.get_chat_member(message.chat.id, target.id)
+        if member.status not in ("administrator", "creator"):
+            await message.answer(f"ℹ️ {html_lib.escape(target.full_name)} is not a group administrator.", parse_mode="HTML")
+            return
+        if member.status == "creator":
+            await message.answer("❌ The group owner cannot be demoted by a bot.")
+            return
+        await bot.promote_chat_member(
+            chat_id=message.chat.id,
+            user_id=target.id,
+            can_manage_chat=False,
+            can_change_info=False,
+            can_post_messages=False,
+            can_edit_messages=False,
+            can_delete_messages=False,
+            can_manage_video_chats=False,
+            can_restrict_members=False,
+            can_promote_members=False,
+            can_invite_users=False,
+            can_pin_messages=False,
+            can_manage_topics=False,
+            can_post_stories=False,
+            can_edit_stories=False,
+            can_delete_stories=False,
+        )
+        await message.answer(f"✅ Removed administrator rights from <a href=\"tg://user?id={target.id}\">{html_lib.escape(target.full_name)}</a>.", parse_mode="HTML")
+    except Exception as exc:
+        detail = getattr(exc, "message", None) or str(exc)
+        await message.answer(
+            "❌ I couldn't demote that administrator. Make sure I'm an admin with the right to add administrators, "
+            "and that you have permission to manage this member.\n"
+            f"Details: {html_lib.escape(str(detail)[:400])}",
+            parse_mode="HTML",
+        )
+
 
 
 @dp.message(Command("kick"))
