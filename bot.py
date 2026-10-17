@@ -12,7 +12,7 @@ from aiogram.enums import ChatType
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton as _InlineKeyboardButton,
-    ChatMember, BotCommand, ChatJoinRequest, TelegramObject, PollAnswer, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats
+    ChatMember, BotCommand, ChatJoinRequest, TelegramObject, PollAnswer, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats, BotCommandScopeChat
 )
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from typing import Callable, Awaitable, Any
@@ -337,14 +337,7 @@ async def replied_target(message: Message):
 
 
 async def bot_can_promote_members(message: Message) -> bool:
-    """Check chat type and the bot's Telegram admin rights before promote/demote calls."""
-    if not message.chat or message.chat.type != ChatType.SUPERGROUP:
-        await message.reply(
-            "❌ Telegram only supports this promote/demote operation in a supergroup. "
-            "Convert this group to a supergroup (Telegram usually does this automatically for larger groups), "
-            "then try again."
-        )
-        return False
+    """Check the bot's Telegram admin rights before promote/demote API calls."""
     try:
         me = await bot.get_me()
         member = await bot.get_chat_member(message.chat.id, me.id)
@@ -733,7 +726,7 @@ async def ask_ai(message: Message, prompt: str):
         return
     log.info("AI providers configured for this request: %s", ", ".join(name for name, _ in providers))
 
-    timeout_seconds = max(6.0, min(float(os.getenv("AI_PROVIDER_TIMEOUT_SECONDS", "12")), 20.0))
+    timeout_seconds = max(2.0, min(float(os.getenv("AI_PROVIDER_TIMEOUT_SECONDS", "4.5")), 10.0))
     last_error = None
     for provider_name, provider in providers:
         try:
@@ -808,7 +801,7 @@ async def ask_ai(message: Message, prompt: str):
         except Exception as exc:
             last_error = exc
             # Include the provider's actual rejection reason in Render logs, but never API keys.
-            detail = str(exc).replace("\n", " ").strip()[:700]
+            detail = (str(exc).replace("\n", " ").strip() or repr(exc))[:700]
             for secret_name in ("GEMINI_API_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY", "OPENROUTER_API_KEY"):
                 secret_value = os.getenv(secret_name, "").strip()
                 if secret_value:
@@ -817,9 +810,13 @@ async def ask_ai(message: Message, prompt: str):
                         provider_name, type(exc).__name__, detail or "<no error detail returned>")
             continue
 
+    final_detail = (str(last_error).replace("\n", " ").strip() or repr(last_error))[:700] if last_error else "none"
+    for secret_name in ("GEMINI_API_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY", "OPENROUTER_API_KEY"):
+        secret_value = os.getenv(secret_name, "").strip()
+        if secret_value:
+            final_detail = final_detail.replace(secret_value, "[REDACTED]")
     log.error("All configured AI providers failed; last error type=%s details=%s",
-              type(last_error).__name__ if last_error else "unknown",
-              (str(last_error).replace("\n", " ")[:700] if last_error else "none"))
+              type(last_error).__name__ if last_error else "unknown", final_detail)
     await message.reply("⚠️ I'm temporarily busy. Please try again in a moment.")
 
 
@@ -873,20 +870,10 @@ async def promote_command(message: Message):
         )
     except Exception as exc:
         detail = getattr(exc, "message", None) or str(exc)
-        detail_text = str(detail)
-        log.warning("Promote failed in chat %s for target %s (%s): %s",
-                    message.chat.id, target.id, type(exc).__name__, detail_text[:500])
-        if "CHAT_ADMIN_REQUIRED" in detail_text or "not enough rights" in detail_text.lower():
-            explanation = (
-                "Telegram rejected the admin change. Confirm Anonymous™ Mini has the specific "
-                "‘Add New Admins / Promote Members’ right, and that the target is not an admin "
-                "with a higher/equal rank than the bot. Telegram controls admin rank server-side."
-            )
-        else:
-            explanation = "Check the bot's admin permissions and the target member, then try again."
         await message.answer(
-            f"❌ I couldn't promote that member. {explanation}\n"
-            f"Telegram: {html_lib.escape(detail_text[:400])}",
+            "❌ I couldn't promote that member. Make sure I'm an admin with the right to add administrators, "
+            "and that you have permission to manage this member.\n"
+            f"Details: {html_lib.escape(str(detail)[:400])}",
             parse_mode="HTML",
         )
 
@@ -933,21 +920,10 @@ async def demote_command(message: Message):
         await message.answer(f"✅ Removed administrator rights from <a href=\"tg://user?id={target.id}\">{html_lib.escape(target.full_name)}</a>.", parse_mode="HTML")
     except Exception as exc:
         detail = getattr(exc, "message", None) or str(exc)
-        detail_text = str(detail)
-        log.warning("Demote failed in chat %s for target %s (%s): %s",
-                    message.chat.id, target.id, type(exc).__name__, detail_text[:500])
-        if "CHAT_ADMIN_REQUIRED" in detail_text or "not enough rights" in detail_text.lower():
-            explanation = (
-                "Telegram rejected the admin change. Confirm Anonymous™ Mini has the specific "
-                "‘Add New Admins / Promote Members’ right, and that the target admin is not "
-                "ranked above the bot. The group owner or an admin with a higher rank may need "
-                "to change that person's status."
-            )
-        else:
-            explanation = "Check the bot's admin permissions and the target member, then try again."
         await message.answer(
-            f"❌ I couldn't demote that administrator. {explanation}\n"
-            f"Telegram: {html_lib.escape(detail_text[:400])}",
+            "❌ I couldn't demote that administrator. Make sure I'm an admin with the right to add administrators, "
+            "and that you have permission to manage this member.\n"
+            f"Details: {html_lib.escape(str(detail)[:400])}",
             parse_mode="HTML",
         )
 
@@ -1117,18 +1093,46 @@ async def pending_rows(chat_id: int):
     with sqlite3.connect(DATABASE_PATH) as conn:
         return conn.execute("SELECT user_id, username, full_name, created_at FROM pending_join_requests WHERE chat_id=? ORDER BY created_at", (chat_id,)).fetchall()
 
+async def bot_can_manage_join_requests(message: Message) -> bool:
+    """Check whether Telegram currently grants this bot join-request management rights."""
+    try:
+        me = await bot.get_me()
+        member = await bot.get_chat_member(message.chat.id, me.id)
+        if member.status not in ("administrator", "creator"):
+            await message.answer("❌ I must be a group administrator to manage join requests.")
+            return False
+        if member.status != "creator" and not getattr(member, "can_invite_users", False):
+            await message.answer(
+                "❌ I am an administrator, but Telegram does not report the 'Invite Users' permission for me. "
+                "Enable Invite Users / Manage Join Requests in my admin rights, then try again."
+            )
+            return False
+        return True
+    except Exception as exc:
+        log.warning("Join-request permission check failed (%s): %r", type(exc).__name__, exc)
+        await message.answer("❌ I couldn't verify my join-request permissions. Check Render Logs for details.")
+        return False
+
 @dp.message(Command("list"))
 async def list_pending_command(message: Message):
     parts = (message.text or "").split()
     if len(parts) < 2 or parts[1].lower() != "pending":
+        await message.answer("Usage: /list pending")
         return
     if not await require_admin(message):
         return
+    if not await bot_can_manage_join_requests(message):
+        return
     rows = await pending_rows(message.chat.id)
     if not rows:
-        await message.answer("📭 No tracked pending join requests for this group.")
+        await message.answer(
+            "📭 I have no tracked pending join requests for this group.\n\n"
+            "I can only list requests Telegram delivered to me while I was running and had admin access. "
+            "Requests created before tracking was active, or while the bot lacked Invite Users permission, "
+            "may not appear here. Ask someone to submit a new join request to test it."
+        )
         return
-    lines = ["⏳ Pending join requests:"]
+    lines = ["⏳ Pending join requests tracked by me:"]
     for user_id, username, full_name, created_at in rows[:50]:
         who = f"@{username}" if username else (full_name or "Unknown user")
         lines.append(f"• {who} — ID: <code>{user_id}</code>")
@@ -1137,6 +1141,8 @@ async def list_pending_command(message: Message):
 
 async def process_pending_request(message: Message, approve: bool):
     if not await require_admin(message):
+        return
+    if not await bot_can_manage_join_requests(message):
         return
     parts = (message.text or "").split()
     if len(parts) < 3 or parts[1].lower() != "pending" or not parts[2].isdigit():
@@ -1156,7 +1162,13 @@ async def process_pending_request(message: Message, approve: bool):
         await message.answer(f"✅ {verb} join request for <code>{user_id}</code>.", parse_mode="HTML")
     except Exception as exc:
         action = "approve" if approve else "decline"
-        await message.answer(f"Couldn't {action} that request. Ensure the bot is an admin with invite-user permissions and the request is still pending. ({type(exc).__name__})")
+        detail = str(exc).replace("\n", " ").strip() or repr(exc)
+        # These errors normally contain Telegram's reason (e.g. request not found / not pending).
+        log.warning("Could not %s join request chat_id=%s user_id=%s (%s): %s", action, message.chat.id, user_id, type(exc).__name__, detail[:500])
+        await message.answer(
+            f"❌ Couldn't {action} join request for <code>{user_id}</code>.\n"
+            f"Reason: <code>{html_lib.escape(detail[:350])}</code>", parse_mode="HTML"
+        )
 
 @dp.message(Command("approve"))
 async def approve_pending_command(message: Message):
@@ -1170,6 +1182,9 @@ async def decline_pending_command(message: Message):
 async def owner_stats_command(message: Message):
     if not owner_only(message):
         await message.answer("⛔ Owner-only command.")
+        return
+    if message.chat.type != ChatType.PRIVATE:
+        await message.answer("🔒 For privacy, use /stats in my private chat.")
         return
     with sqlite3.connect(DATABASE_PATH) as conn:
         dm_users = conn.execute("SELECT COUNT(DISTINCT user_id) FROM users WHERE private_chat_id IS NOT NULL").fetchone()[0]
@@ -1186,6 +1201,9 @@ async def owner_stats_command(message: Message):
 async def owner_broadcast_command(message: Message):
     if not owner_only(message):
         await message.answer("⛔ Owner-only command.")
+        return
+    if message.chat.type != ChatType.PRIVATE:
+        await message.answer("🔒 For safety, run /broadcast from my private chat.")
         return
     announcement = (message.text or "").partition(" ")[2].strip()
     if not announcement:
@@ -1258,10 +1276,19 @@ async def main():
         BotCommand(command="broadcast", description="Owner announcement broadcast"),
         BotCommand(command="ai", description="Ask AI"),
     ]
-    # Telegram has separate command menus for groups and private chats.
-    await bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats())
-    group_commands = commands[:]
+    # Keep owner-only commands out of the public menus. Telegram command menus are
+    # visibility only; handlers below still enforce OWNER_ID for security.
+    owner_command_names = {"stats", "broadcast"}
+    public_commands = [command for command in commands if command.command not in owner_command_names]
+    await bot.set_my_commands(public_commands, scope=BotCommandScopeAllPrivateChats())
+    group_commands = [command for command in public_commands if command.command not in {"stats", "broadcast"}]
     await bot.set_my_commands(group_commands, scope=BotCommandScopeAllGroupChats())
+    if OWNER_ID:
+        owner_commands = public_commands + [command for command in commands if command.command in owner_command_names]
+        await bot.set_my_commands(owner_commands, scope=BotCommandScopeChat(chat_id=OWNER_ID))
+        log.info("Owner-only command menu configured for OWNER_ID=%s", OWNER_ID)
+    else:
+        log.warning("OWNER_ID is not configured. /stats and /broadcast will be inaccessible until OWNER_ID is set in Render Environment.")
     runner = await start_http_server()
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
