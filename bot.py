@@ -3,17 +3,13 @@ import logging
 import os
 import random
 import time
-import sqlite3
-from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
-from html import escape
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ChatType
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    ChatMember, BotCommand, ChatPermissions
+    ChatMember, BotCommand
 )
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.utils.chat_action import ChatActionSender
@@ -31,9 +27,6 @@ log = logging.getLogger("anonymous-mini")
 
 TOKEN = os.getenv("TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY", "").strip()
 PORT = int(os.getenv("PORT", "10000"))
 
 
@@ -64,136 +57,11 @@ if GEMINI_API_KEY:
 # Active riddles are kept per chat and user while this process is running.
 ACTIVE_RIDDLES = {}
 # Short-lived conversational context, kept separately for each user in each chat.
-AI_HISTORY = {}  # compatibility cache; persistent SQLite is the source of truth.
-AI_HISTORY_TURNS = 12
-MEMORY_DB_PATH = os.getenv(
-    "MEMORY_DB_PATH",
-    "/var/data/anonymous_memory.sqlite3" if os.path.isdir("/var/data") else "anonymous_memory.sqlite3",
-)
-
-
-def db_connect():
-    connection = sqlite3.connect(MEMORY_DB_PATH, timeout=15)
-    connection.row_factory = sqlite3.Row
-    return connection
-
-
-@contextmanager
-def db_session():
-    connection = db_connect()
-    try:
-        yield connection
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
-
-
-def init_database():
-    parent = os.path.dirname(os.path.abspath(MEMORY_DB_PATH))
-    os.makedirs(parent, exist_ok=True)
-    with db_session() as conn:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("""CREATE TABLE IF NOT EXISTS chat_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
-            role TEXT NOT NULL, content TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )""")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_history_chat_user ON chat_history(chat_id, user_id, id)")
-        conn.execute("""CREATE TABLE IF NOT EXISTS user_memories (
-            chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
-            fact TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(chat_id, user_id, fact)
-        )""")
-        conn.execute("""CREATE TABLE IF NOT EXISTS warnings (
-            chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL, count INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY(chat_id, user_id)
-        )""")
-
-
-def load_history(chat_id: int, user_id: int, limit: int = 24):
-    with db_session() as conn:
-        rows = conn.execute(
-            "SELECT role, content FROM chat_history WHERE chat_id=? AND user_id=? ORDER BY id DESC LIMIT ?",
-            (chat_id, user_id, limit),
-        ).fetchall()
-    return [(row["role"], row["content"]) for row in reversed(rows)]
-
-
-def save_history_turn(chat_id: int, user_id: int, prompt: str, answer: str):
-    with db_session() as conn:
-        conn.executemany(
-            "INSERT INTO chat_history(chat_id,user_id,role,content) VALUES(?,?,?,?)",
-            [(chat_id, user_id, "user", prompt[:6000]), (chat_id, user_id, "assistant", answer[:6000])],
-        )
-        # Keep the most recent 200 messages per chat/user; long-term facts are stored separately.
-        conn.execute("""DELETE FROM chat_history WHERE chat_id=? AND user_id=? AND id NOT IN
-            (SELECT id FROM chat_history WHERE chat_id=? AND user_id=? ORDER BY id DESC LIMIT 200)""",
-            (chat_id, user_id, chat_id, user_id))
-
-
-def extract_memory_facts(chat_id: int, user_id: int, text: str):
-    """Store a few explicit, low-risk self-descriptions without making guesses."""
-    import re
-    patterns = [
-        r"\bmy name is ([^.!?\n]{1,60})",
-        r"\bcall me ([^.!?\n]{1,60})",
-        r"\bi am from ([^.!?\n]{1,80})",
-        r"\bi'm from ([^.!?\n]{1,80})",
-        r"\bi study ([^.!?\n]{1,100})",
-        r"\bi am learning ([^.!?\n]{1,100})",
-        r"\bi'm learning ([^.!?\n]{1,100})",
-        r"\bi work as ([^.!?\n]{1,100})",
-        r"\bi like ([^.!?\n]{1,100})",
-        r"\bi love ([^.!?\n]{1,100})",
-        r"\bmy project is ([^.!?\n]{1,100})",
-    ]
-    lower = text.strip()
-    facts = []
-    for pattern in patterns:
-        match = re.search(pattern, lower, flags=re.IGNORECASE)
-        if match:
-            value = match.group(1).strip(" ,;:")
-            if value and len(value) <= 100:
-                facts.append(text.strip()[:160])
-                break
-    if facts:
-        with db_session() as conn:
-            for fact in facts:
-                conn.execute(
-                    "INSERT OR IGNORE INTO user_memories(chat_id,user_id,fact) VALUES(?,?,?)",
-                    (chat_id, user_id, fact),
-                )
-            # Limit saved facts so stale context cannot grow forever.
-            conn.execute("""DELETE FROM user_memories WHERE rowid IN (
-                SELECT rowid FROM user_memories WHERE chat_id=? AND user_id=?
-                ORDER BY rowid DESC LIMIT -1 OFFSET 40)""", (chat_id, user_id))
-
-
-def load_memories(chat_id: int, user_id: int):
-    with db_session() as conn:
-        rows = conn.execute(
-            "SELECT fact FROM user_memories WHERE chat_id=? AND user_id=? ORDER BY rowid DESC LIMIT 40",
-            (chat_id, user_id),
-        ).fetchall()
-    return [row["fact"] for row in reversed(rows)]
-
-
-def warning_count(chat_id: int, user_id: int) -> int:
-    with db_session() as conn:
-        row = conn.execute("SELECT count FROM warnings WHERE chat_id=? AND user_id=?", (chat_id, user_id)).fetchone()
-    return int(row["count"]) if row else 0
-
-
-def set_warning_count(chat_id: int, user_id: int, count: int):
-    with db_session() as conn:
-        if count <= 0:
-            conn.execute("DELETE FROM warnings WHERE chat_id=? AND user_id=?", (chat_id, user_id))
-        else:
-            conn.execute("INSERT INTO warnings(chat_id,user_id,count) VALUES(?,?,?) ON CONFLICT(chat_id,user_id) DO UPDATE SET count=excluded.count", (chat_id, user_id, count))
+AI_HISTORY = {}
+AI_HISTORY_TURNS = 8
+QUIZ_SETUP = {}  # setup progress keyed by chat and user
+ACTIVE_QUIZZES = {}  # one live quiz per chat
+QUIZ_TIMERS = {}
 
 
 def main_menu() -> InlineKeyboardMarkup:
@@ -227,7 +95,7 @@ HELP_TEXT = (
     "• Use the buttons below to explore.\n"
     "• In groups, reply to a message when using moderation commands.\n"
     "• Group moderation commands generally require admin permissions.\n"
-    "• AI works with any configured OpenRouter, Groq, Gemini, or Cerebras API key.\n• Conversation history and saved facts are stored separately per user and chat."
+    "• AI requires the OPENAI_API_KEY environment variable."
 )
 
 COMMANDS_TEXT = (
@@ -249,17 +117,14 @@ COMMANDS_TEXT = (
     "/truth — Random truth question\n"
     "/dare — Random dare\n"
     "/riddle — Get a riddle\n"
-    "/quiz — Quick multiple-choice quiz\n"
+    "/quiz — Set up a timed category quiz\n"
     "/ship @user @user — Fun compatibility score\n\n"
     "🤖 AI\n"
     "/ai your question — Ask AI (requires API key)\n"
-    "/memory — View saved facts for this chat\n"
-    "/forgetme — Delete your AI history and memories here\n\n"
-    "🛡️ Group admins (reply to a user's message unless stated)\n"
-    "/ban, /unban USER_ID, /kick, /mute [minutes], /unmute\n"
-    "/warn, /warnings, /resetwarnings, /promote, /demote\n"
-    "/pin, /unpin, /del, /purge [1-50], /close, /open, /adminlist, /id\n"
-    "Bot must be an admin with the required permissions."
+    "In groups, mention Anonymous followed by your question.\n\n"
+    "🛡️ Group admins\n"
+    "/ban, /unban, /kick, /mute, /unmute, /warn, /warnings\n"
+    "Use these in a group and reply to the person’s message."
 )
 
 ABOUT_TEXT = (
@@ -318,13 +183,50 @@ RIDDLES = [
     ("What has to be broken before you can use it?", "An egg 🥚"),
     ("What goes up but never comes down?", "Your age 🎂")
 ]
-QUIZZES = [
-    ("Which planet is known as the Red Planet?", ["Venus", "Mars", "Jupiter"], 1),
-    ("How many sides does a hexagon have?", ["5", "6", "8"], 1),
-    ("Which animal is the largest mammal?", ["Blue whale", "Elephant", "Giraffe"], 0),
-    ("What is 9 × 7?", ["56", "63", "72"], 1),
-    ("Which ocean is the largest?", ["Atlantic", "Indian", "Pacific"], 2),
+QUIZ_QUESTIONS = [
+    # Arts & Literature
+    ("Arts & Literature", "Easy", "Who wrote Romeo and Juliet?", ["Charles Dickens", "William Shakespeare", "Jane Austen", "Mark Twain"], 1),
+    ("Arts & Literature", "Medium", "Which novel begins with the line 'Call me Ishmael'?", ["Moby-Dick", "The Great Gatsby", "Jane Eyre", "1984"], 0),
+    ("Arts & Literature", "Hard", "Who painted the ceiling of the Sistine Chapel?", ["Leonardo da Vinci", "Raphael", "Michelangelo", "Donatello"], 2),
+    # Film & TV
+    ("Film & TV", "Easy", "Which fictional wizard attends Hogwarts?", ["Gandalf", "Harry Potter", "Merlin", "Doctor Strange"], 1),
+    ("Film & TV", "Medium", "In which film franchise would you find the character Darth Vader?", ["Star Trek", "The Matrix", "Star Wars", "Dune"], 2),
+    ("Film & TV", "Hard", "Who directed the 1994 film Pulp Fiction?", ["Martin Scorsese", "Quentin Tarantino", "Steven Spielberg", "David Fincher"], 1),
+    # Food & Drink
+    ("Food & Drink", "Easy", "Which ingredient is traditionally used to make guacamole?", ["Avocado", "Cucumber", "Green peas", "Zucchini"], 0),
+    ("Food & Drink", "Medium", "Which country is widely associated with the origin of sushi?", ["Thailand", "Japan", "India", "Mexico"], 1),
+    ("Food & Drink", "Hard", "What is the main ingredient in traditional hummus?", ["Lentils", "Chickpeas", "Black beans", "Potatoes"], 1),
+    # General Knowledge
+    ("General Knowledge", "Easy", "How many sides does a hexagon have?", ["Five", "Six", "Seven", "Eight"], 1),
+    ("General Knowledge", "Medium", "What is the smallest prime number?", ["0", "1", "2", "3"], 2),
+    ("General Knowledge", "Hard", "Which element has the chemical symbol W?", ["Tin", "Tungsten", "Titanium", "Zinc"], 1),
+    # Geography
+    ("Geography", "Easy", "What is the capital of Japan?", ["Seoul", "Beijing", "Tokyo", "Bangkok"], 2),
+    ("Geography", "Medium", "Which river flows through Egypt?", ["Amazon", "Nile", "Danube", "Mekong"], 1),
+    ("Geography", "Hard", "Which is the world's largest landlocked country by area?", ["Mongolia", "Chad", "Kazakhstan", "Bolivia"], 2),
+    # History
+    ("History", "Easy", "The ancient pyramids of Giza are in which country?", ["Greece", "Egypt", "Peru", "Jordan"], 1),
+    ("History", "Medium", "In which year did the Berlin Wall fall?", ["1987", "1989", "1991", "1993"], 1),
+    ("History", "Hard", "Which empire was ruled by Mansa Musa in the 14th century?", ["Mali Empire", "Roman Empire", "Ottoman Empire", "Mongol Empire"], 0),
+    # Music
+    ("Music", "Easy", "How many strings does a standard violin have?", ["Four", "Five", "Six", "Seven"], 0),
+    ("Music", "Medium", "Which composer wrote the Moonlight Sonata?", ["Mozart", "Beethoven", "Bach", "Chopin"], 1),
+    ("Music", "Hard", "Which instrument family does the oboe belong to?", ["Brass", "Percussion", "Woodwind", "Strings"], 2),
+    # Science
+    ("Science", "Easy", "Which planet is known as the Red Planet?", ["Venus", "Mars", "Jupiter", "Mercury"], 1),
+    ("Science", "Medium", "What gas do plants absorb during photosynthesis?", ["Oxygen", "Nitrogen", "Carbon dioxide", "Hydrogen"], 2),
+    ("Science", "Hard", "What is the SI unit of electrical resistance?", ["Volt", "Watt", "Ampere", "Ohm"], 3),
+    # Society & Culture
+    ("Society & Culture", "Easy", "Which language is primarily spoken in Brazil?", ["Spanish", "Portuguese", "French", "Italian"], 1),
+    ("Society & Culture", "Medium", "What is the traditional Japanese art of paper folding called?", ["Ikebana", "Origami", "Calligraphy", "Kintsugi"], 1),
+    ("Society & Culture", "Hard", "The ancient Olympic Games originated in which Greek region?", ["Attica", "Elis", "Ionia", "Macedonia"], 1),
+    # Sport & Leisure
+    ("Sport & Leisure", "Easy", "How many players from one team are on the field in a standard football (soccer) match?", ["9", "10", "11", "12"], 2),
+    ("Sport & Leisure", "Medium", "In chess, which piece can only move diagonally?", ["Bishop", "Rook", "Queen", "King"], 0),
+    ("Sport & Leisure", "Hard", "In tennis, what score comes after deuce when a player wins the next point?", ["Game", "Advantage", "Love", "Set"], 1),
 ]
+QUIZ_CATEGORIES = ["Arts & Literature", "Film & TV", "Food & Drink", "General Knowledge", "Geography", "History", "Music", "Science", "Society & Culture", "Sport & Leisure"]
+
 EIGHT_BALL = [
     "🎱 Yes, definitely.", "🎱 No doubt about it.", "🎱 Ask again later.",
     "🎱 The signs point to yes.", "🎱 Better not tell you now.",
@@ -477,29 +379,195 @@ async def riddle(message: Message):
     await message.answer(f"🧩 RIDDLE: {question}\n\nReply with your guess! I'll tell you whether you're right. 🤔")
 
 
+def quiz_setup_keyboard(step: str, state: dict) -> InlineKeyboardMarkup:
+    if step == "category":
+        rows = []
+        for i in range(0, len(QUIZ_CATEGORIES), 2):
+            row = [InlineKeyboardButton(text=c, callback_data=f"qsetup:cat:{c}") for c in QUIZ_CATEGORIES[i:i+2]]
+            rows.append(row)
+    elif step == "difficulty":
+        rows = [[InlineKeyboardButton(text=x, callback_data=f"qsetup:diff:{x}") for x in ["Any", "Easy", "Medium", "Hard"]]]
+    elif step == "rounds":
+        rows = [[InlineKeyboardButton(text=f"{n} rounds", callback_data=f"qsetup:rounds:{n}") for n in [5, 10, 15]]]
+    elif step == "time":
+        rows = [[InlineKeyboardButton(text=f"{n}s", callback_data=f"qsetup:time:{n}") for n in [15, 30, 45]]]
+    else:
+        rows = [[InlineKeyboardButton(text="▶️ Start", callback_data="qsetup:start")]]
+    rows.append([InlineKeyboardButton(text="Cancel", callback_data="qsetup:cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def quiz_setup_text(step: str, state: dict) -> str:
+    labels = {"category": "1/4 — Choose a category", "difficulty": "2/4 — Choose a difficulty", "rounds": "3/4 — Choose the number of rounds", "time": "4/4 — Choose time per question", "ready": "QUIZ READY"}
+    summary = (f"Starter: {state.get('starter', 'Player')}\nCategory: {state.get('category', '—')}\n"
+               f"Difficulty: {state.get('difficulty', '—')}\nRounds: {state.get('rounds', '—')}\nTime: {state.get('seconds', '—')}s/question")
+    if step == "category":
+        return "🧠 QUIZ SETUP · " + labels[step] + "\n\nChoose a category. Questions are curated and matched to the category and difficulty."
+    if step == "difficulty":
+        return "🧠 QUIZ SETUP · " + labels[step] + "\n\n" + summary + "\n\nChoose a difficulty."
+    if step == "rounds":
+        return "🧠 QUIZ SETUP · " + labels[step] + "\n\n" + summary + "\n\nChoose the number of rounds."
+    if step == "time":
+        return "🧠 QUIZ SETUP · " + labels[step] + "\n\n" + summary + "\n\nChoose time per question."
+    return "✅ QUIZ READY\n\n" + summary + "\n\nPress Start when ready. After each timer ends, I'll reveal the correct answer and then move to the next round."
+
+
 @dp.message(Command("quiz"))
 async def quiz(message: Message):
-    question, options, correct = random.choice(QUIZZES)
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=option, callback_data=f"quiz:{correct}:{i}:{option}")]
-        for i, option in enumerate(options)
-    ])
-    await message.answer("🧠 QUICK QUIZ\n\n" + question, reply_markup=keyboard)
-
-
-@dp.callback_query(F.data.startswith("quiz:"))
-async def quiz_answer(callback: CallbackQuery):
-    try:
-        _, correct_s, chosen_s, option = callback.data.split(":", 3)
-        correct, chosen = int(correct_s), int(chosen_s)
-        if chosen == correct:
-            await callback.message.edit_text(f"✅ Correct! {option} — you earned 10,000 fun coins in spirit! 🪙")
-        else:
-            await callback.message.edit_text(f"❌ Not quite! You chose {option}. Try another /quiz.")
-    except Exception:
-        await callback.answer("This quiz has expired.", show_alert=True)
+    if not message.from_user:
         return
+    key = (message.chat.id, message.from_user.id)
+    state = {"starter": message.from_user.full_name, "category": None, "difficulty": None, "rounds": None, "seconds": None}
+    QUIZ_SETUP[key] = state
+    await message.answer(quiz_setup_text("category", state), reply_markup=quiz_setup_keyboard("category", state))
+
+
+@dp.callback_query(F.data.startswith("qsetup:"))
+async def quiz_setup_callback(callback: CallbackQuery):
+    if not callback.message or not callback.from_user:
+        await callback.answer()
+        return
+    key = (callback.message.chat.id, callback.from_user.id)
+    state = QUIZ_SETUP.get(key)
+    if callback.data == "qsetup:cancel":
+        QUIZ_SETUP.pop(key, None)
+        await callback.message.edit_text("Quiz setup cancelled.")
+        await callback.answer()
+        return
+    if not state:
+        await callback.answer("Start a new quiz with /quiz.", show_alert=True)
+        return
+    parts = callback.data.split(":", 2)
+    action = parts[1]
+    value = parts[2] if len(parts) > 2 else ""
+    if action == "cat":
+        state["category"] = value
+        step = "difficulty"
+    elif action == "diff":
+        state["difficulty"] = value
+        step = "rounds"
+    elif action == "rounds":
+        state["rounds"] = int(value)
+        step = "time"
+    elif action == "time":
+        state["seconds"] = int(value)
+        step = "ready"
+    elif action == "start":
+        QUIZ_SETUP.pop(key, None)
+        chat_id = callback.message.chat.id
+        old = ACTIVE_QUIZZES.get(chat_id)
+        if old and old.get("task"):
+            old["task"].cancel()
+        pool = [q for q in QUIZ_QUESTIONS if q[0] == state["category"] and (state["difficulty"] == "Any" or q[1] == state["difficulty"])]
+        if not pool:
+            await callback.message.edit_text("I don't have enough verified questions for that selection yet. Try Difficulty: Any.")
+            await callback.answer()
+            return
+        rounds = state["rounds"]
+        # Build the requested number of rounds. Prefer unique questions first; if the selected
+        # category/difficulty has a smaller bank, reshuffle the bank for extra rounds.
+        questions = []
+        while len(questions) < rounds:
+            batch = random.sample(pool, len(pool))
+            if questions and len(batch) > 1 and batch[0] == questions[-1]:
+                batch[0], batch[1] = batch[1], batch[0]
+            questions.extend(batch[:rounds - len(questions)])
+        ACTIVE_QUIZZES[chat_id] = {"owner": callback.from_user.id, "starter": state["starter"], "category": state["category"], "difficulty": state["difficulty"], "seconds": state["seconds"], "questions": questions, "index": 0, "scores": {}, "answers": {}, "message_id": callback.message.message_id, "task": None}
+        await callback.answer("Quiz starting!")
+        await send_quiz_question(chat_id, callback.message.message_id)
+        return
+    await callback.message.edit_text(quiz_setup_text(step, state), reply_markup=quiz_setup_keyboard(step, state))
     await callback.answer()
+
+
+async def send_quiz_question(chat_id: int, message_id: int):
+    quiz_state = ACTIVE_QUIZZES.get(chat_id)
+    if not quiz_state:
+        return
+    idx = quiz_state["index"]
+    if idx >= len(quiz_state["questions"]):
+        score_lines = sorted(quiz_state["scores"].items(), key=lambda item: (-item[1], item[0]))
+        leaderboard = "\\n".join(f"{i+1}. {name}: {score}/{len(quiz_state['questions'])}" for i, (name, score) in enumerate(score_lines[:10])) or "No answers recorded."
+        try:
+            await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=f"🏁 QUIZ FINISHED!\\n{quiz_state['category']} · {len(quiz_state['questions'])} rounds\\n\\n🏆 Scores\\n{leaderboard}")
+        except TelegramBadRequest:
+            pass
+        ACTIVE_QUIZZES.pop(chat_id, None)
+        return
+    category, difficulty, question, options, correct = quiz_state["questions"][idx]
+    quiz_state["answers"] = {}
+    buttons = [[InlineKeyboardButton(text=opt, callback_data=f"qans:{idx}:{i}")] for i, opt in enumerate(options)]
+    text = (f"🧠 {category} · {difficulty} · Round {idx+1}/{len(quiz_state['questions'])}\\n"
+            f"⏱ Time: {quiz_state['seconds']} seconds\\n\\n{question}\\n\\nChoose your answer before time runs out.")
+    try:
+        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    except TelegramBadRequest:
+        return
+    task = asyncio.create_task(quiz_question_timer(chat_id, message_id, idx))
+    quiz_state["task"] = task
+
+
+@dp.callback_query(F.data.startswith("qans:"))
+async def quiz_answer(callback: CallbackQuery):
+    if not callback.message or not callback.from_user:
+        await callback.answer()
+        return
+    quiz_state = ACTIVE_QUIZZES.get(callback.message.chat.id)
+    if not quiz_state:
+        await callback.answer("This quiz has ended.", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    idx, chosen = int(parts[1]), int(parts[2])
+    if idx != quiz_state["index"]:
+        await callback.answer("That question has expired.", show_alert=True)
+        return
+    user_id = callback.from_user.id
+    quiz_state["answers"][user_id] = chosen
+    await callback.answer("Answer locked in! The correct answer is revealed when time runs out.")
+
+
+async def quiz_question_timer(chat_id: int, message_id: int, idx: int):
+    try:
+        await asyncio.sleep(ACTIVE_QUIZZES[chat_id]["seconds"])
+        state = ACTIVE_QUIZZES.get(chat_id)
+        if not state or state["index"] != idx:
+            return
+        category, difficulty, question, options, correct = state["questions"][idx]
+        # Score each player's final submitted answer for this round.
+        for user_id, chosen in state["answers"].items():
+            member = await bot.get_chat_member(chat_id, user_id)
+            name = member.user.full_name if member and member.user else str(user_id)
+            state["scores"][name] = state["scores"].get(name, 0) + (1 if chosen == correct else 0)
+        result = (f"⏰ TIME'S UP! · Round {idx+1}/{len(state['questions'])}\\n\\n{question}\\n\\n"
+                  f"✅ Correct answer: {options[correct]}\\n\\n")
+        if state["answers"]:
+            result += f"Answers received: {len(state['answers'])} player(s).\\n"
+        else:
+            result += "Nobody answered in time.\\n"
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Next question ➡️", callback_data=f"qnext:{idx}")]])
+        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=result, reply_markup=keyboard)
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        log.exception("Quiz timer failed")
+
+
+@dp.callback_query(F.data.startswith("qnext:"))
+async def quiz_next(callback: CallbackQuery):
+    if not callback.message:
+        await callback.answer()
+        return
+    state = ACTIVE_QUIZZES.get(callback.message.chat.id)
+    if not state:
+        await callback.answer("This quiz has ended.", show_alert=True)
+        return
+    idx = int(callback.data.split(":", 1)[1])
+    if idx != state["index"]:
+        await callback.answer("This question has already moved on.", show_alert=True)
+        return
+    state["index"] += 1
+    await callback.answer()
+    await send_quiz_question(callback.message.chat.id, callback.message.message_id)
 
 
 @dp.message(Command("ship"))
@@ -520,408 +588,201 @@ async def ai_command(message: Message):
     if not prompt:
         await message.answer("🤖 Ask me something: /ai explain black holes simply")
         return
-    if not any([GEMINI_API_KEY, OPENROUTER_API_KEY, GROQ_API_KEY, CEREBRAS_API_KEY]):
-        await message.answer("⚠️ No AI provider is configured. Add at least one AI API key in Render → Environment.")
+    if ai_client is None:
+        await message.answer("⚠️ Gemini AI isn't configured. Add GEMINI_API_KEY in Render → Environment.")
         return
     await ask_ai(message, prompt)
 
 
-async def _chat_completion(provider: str, api_key: str, model: str, conversation: str) -> str:
-    """Call a chat-completions provider using its OpenAI-compatible API."""
-    import aiohttp
-
-    endpoints = {
-        "OpenRouter": "https://openrouter.ai/api/v1/chat/completions",
-        "Groq": "https://api.groq.com/openai/v1/chat/completions",
-        "Cerebras": "https://api.cerebras.ai/v1/chat/completions",
-    }
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    if provider == "OpenRouter":
-        headers["HTTP-Referer"] = "https://t.me/"
-        headers["X-Title"] = "Anonymous Mini"
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": conversation}],
-        "temperature": 0.7,
-    }
-    timeout = aiohttp.ClientTimeout(total=45)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(endpoints[provider], headers=headers, json=payload) as response:
-            body = await response.text()
-            if response.status >= 400:
-                # Include provider response in logs, but never expose API keys.
-                raise RuntimeError(f"{provider} HTTP {response.status}: {body[:700]}")
-            try:
-                data = await response.json(content_type=None)
-                return (data.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
-            except Exception as exc:
-                raise RuntimeError(f"{provider} returned an unreadable response: {body[:300]}") from exc
-
-
 async def ask_ai(message: Message, prompt: str):
-    configured = any([GEMINI_API_KEY, OPENROUTER_API_KEY, GROQ_API_KEY, CEREBRAS_API_KEY])
-    if not configured:
-        await message.reply("⚠️ No AI provider is configured. Add at least one AI API key in Render → Environment.")
+    if ai_client is None:
+        await message.reply("⚠️ Gemini AI isn't configured. Add GEMINI_API_KEY in Render → Environment.")
         return
 
-    user_id = message.from_user.id if message.from_user else 0
-    chat_id = message.chat.id
-    extract_memory_facts(chat_id, user_id, prompt)
-    history = load_history(chat_id, user_id)
-    memories = load_memories(chat_id, user_id)
+    # Keep a short recent history so replies feel like a real conversation.
+    history_key = (message.chat.id, message.from_user.id if message.from_user else 0)
+    history = AI_HISTORY.setdefault(history_key, [])
+    primary_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+    fallback_model = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash-lite").strip()
+    models = [primary_model]
+    if fallback_model and fallback_model != primary_model:
+        models.append(fallback_model)
 
     system_instruction = (
-        "You are Anonymous™ Mini, a smart, warm, witty, natural conversational AI in Telegram. "
-        "Talk like a normal person, not a customer-support script. Use the conversation history and saved facts "
-        "to understand follow-ups and recall details the user previously shared. Keep each user's context private "
-        "to this chat; never claim to remember details that are not in the provided context. Answer directly and "
-        "match the user's tone and language. Do not routinely end with 'Is there anything else I can help with?' "
-        "Only ask a follow-up when genuinely needed. Do not output HTML tags. "
-        "Your founder is 𝐋 𝐎 𝐑 𝐃 ♰ 𝐀𝐍𝐎𝐍𝐘𝐌𝐎𝐔𝐒™."
+        "You are Anonymous™ Mini, a smart, warm, witty, natural conversational AI in a Telegram group. "
+        "Talk like a normal helpful person, not a customer-support script or robotic FAQ bot. "
+        "Use the recent conversation to understand follow-up messages and remember what was just discussed. "
+        "Answer the actual question directly; match the user's tone and language when appropriate. "
+        "Do not automatically end replies with 'Is there anything else I can help with?', 'Anything else?', "
+        "or other forced follow-up questions. Only ask a follow-up when it is genuinely needed. "
+        "If someone only calls 'Anonymous' to get your attention, respond naturally and briefly, "
+        "for example by asking what is up, without a canned 'Ask me anything' line. "
+        "Do not output HTML tags. Your founder is 𝐋 𝐎 𝐑 𝐃 ♰ 𝐀𝐍𝐎𝐍𝐘𝐌𝐎𝐔𝐒™."
     )
-    context = [system_instruction]
-    if memories:
-        context.append("Saved facts this user explicitly shared in this chat:\n- " + "\n- ".join(memories))
-    if history:
-        context.append("Recent conversation:\n" + "\n".join(
-            ("User: " if role == "user" else "Anonymous™ Mini: ") + content
-            for role, content in history[-(AI_HISTORY_TURNS * 2):]
-        ))
-    context.append("New user message: " + prompt)
-    conversation = "\n\n".join(context)
+    recent = history[-(AI_HISTORY_TURNS * 2):]
+    conversation = system_instruction + "\n\nRecent conversation:\n"
+    if recent:
+        conversation += "\n".join(
+            ("User: " if role == "user" else "Anonymous: ") + content
+            for role, content in recent
+        ) + "\n"
+    conversation += "User: " + prompt
 
-    # Each configured provider is tried once in sequence. A quota/rate-limit,
-    # auth, model, or temporary failure advances to the next provider.
-    providers = []
-    if OPENROUTER_API_KEY:
-        providers.append(("OpenRouter", OPENROUTER_API_KEY,
-                          os.getenv("OPENROUTER_MODEL", "openai/gpt-oss-20b").strip()))
-    if GROQ_API_KEY:
-        providers.append(("Groq", GROQ_API_KEY,
-                          os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip()))
-    if GEMINI_API_KEY and ai_client is not None:
-        providers.append(("Gemini", GEMINI_API_KEY,
-                          os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()))
-    if CEREBRAS_API_KEY:
-        providers.append(("Cerebras", CEREBRAS_API_KEY,
-                          os.getenv("CEREBRAS_MODEL", "llama-3.3-70b").strip()))
-
-    errors = []
-    for provider, api_key, model in providers:
+    last_error = None
+    for index, model_name in enumerate(models):
         try:
-            log.info("Trying AI provider %s (model %s)", provider, model)
-            async with ChatActionSender(bot=bot, chat_id=chat_id, action="typing"):
-                if provider == "Gemini":
-                    response = await ai_client.aio.models.generate_content(model=model, contents=conversation)
-                    answer = (getattr(response, "text", None) or "").strip()
-                else:
-                    answer = await _chat_completion(provider, api_key, model, conversation)
+            # ChatActionSender refreshes Telegram's typing indicator while Gemini works.
+            async with ChatActionSender(bot=bot, chat_id=message.chat.id, action="typing"):
+                response = await ai_client.aio.models.generate_content(
+                    model=model_name,
+                    contents=conversation,
+                )
+            answer = (getattr(response, "text", None) or "").strip()
             if not answer:
-                raise RuntimeError(f"{provider} returned an empty answer")
+                answer = "Hmm, I couldn't put that into words just now. Try asking me again."
             if len(answer) > 4000:
                 answer = answer[:3900] + "\n\n…(message shortened)"
             await message.reply(answer)
-            save_history_turn(chat_id, user_id, prompt, answer)
-            log.info("AI response succeeded with %s", provider)
+            history.extend([("user", prompt), ("assistant", answer)])
+            AI_HISTORY[history_key] = history[-(AI_HISTORY_TURNS * 2):]
             return
         except Exception as exc:
-            errors.append(f"{provider}: {exc}")
-            log.warning("AI provider %s failed; trying next provider. Error: %s", provider, exc)
+            last_error = exc
+            detail = str(exc).lower()
+            is_quota_error = (
+                "quota" in detail or "resource_exhausted" in detail
+                or "rate limit" in detail or "429" in detail
+            )
+            if is_quota_error and index < len(models) - 1:
+                log.warning(
+                    "Gemini model %s hit a quota/rate limit; trying fallback model %s",
+                    model_name, models[index + 1]
+                )
+                continue
 
-    log.error("All configured AI providers failed: %s", " | ".join(errors))
-    await message.reply(
-        "⚠️ All configured AI providers are temporarily unavailable or have reached their limits. "
-        "Please try again later."
-    )
+            log.exception("Gemini AI request failed using model %s", model_name)
+            name = type(exc).__name__.lower()
+            if "auth" in name or "api key" in detail or "permission" in name:
+                reply = "⚠️ Gemini rejected the API key. Check GEMINI_API_KEY in Render Environment."
+            elif is_quota_error:
+                reply = (
+                    "⚠️ Gemini's available quota is exhausted for the configured and fallback models. "
+                    "Please wait for quota to reset or check Google AI Studio usage."
+                )
+            elif "model" in detail or "not found" in detail:
+                reply = f"⚠️ Gemini model '{model_name}' isn't available for this key. Check GEMINI_MODEL in Render Environment."
+            else:
+                reply = "⚠️ Gemini couldn't answer just now. Check the latest Render logs for the exact error."
+            await message.reply(reply)
+            return
 
+    if last_error:
+        log.error("All configured Gemini models failed: %s", last_error)
+        await message.reply("⚠️ Gemini couldn't answer right now. Please try again later or check AI Studio usage.")
 
-@dp.message(Command("memory"))
-async def memory_command(message: Message):
-    if not message.from_user:
-        return
-    facts = load_memories(message.chat.id, message.from_user.id)
-    if not facts:
-        await message.reply("🧠 I haven't saved any personal facts from this chat yet. Keep chatting naturally.")
-        return
-    await message.reply("🧠 Things I remember from this chat:\n• " + "\n• ".join(facts[-20:]))
-
-
-@dp.message(Command("forgetme"))
-async def forgetme_command(message: Message):
-    if not message.from_user:
-        return
-    with db_session() as conn:
-        conn.execute("DELETE FROM chat_history WHERE chat_id=? AND user_id=?", (message.chat.id, message.from_user.id))
-        conn.execute("DELETE FROM user_memories WHERE chat_id=? AND user_id=?", (message.chat.id, message.from_user.id))
-    AI_HISTORY.pop((message.chat.id, message.from_user.id), None)
-    await message.reply("🧹 Done — I've cleared your saved AI conversation and facts for this chat.")
-
-
-# Group moderation: only actual group admins can invoke these commands.
-async def admin_target(message: Message):
-    target = await replied_target(message)
-    if target and message.from_user and target.id == message.from_user.id:
-        await message.reply("⚠️ You can't use that command on yourself.")
-        return None
-    return target
-
-
+# Reply-based group moderation commands.
 @dp.message(Command("ban"))
 async def ban_command(message: Message):
     if not await require_admin(message): return
-    target = await admin_target(message)
+    target = await replied_target(message)
     if not target: return
     try:
         await bot.ban_chat_member(message.chat.id, target.id)
-        await message.answer(f'🔨 Banned <a href="tg://user?id={target.id}">{escape(target.full_name)}</a>.', parse_mode="HTML")
+        await message.answer(f"🔨 Banned <a href=\"tg://user?id={target.id}\">{target.full_name}.")
     except Exception as e:
-        await message.answer(f"❌ Ban failed. Check that I'm an admin with ban rights. ({type(e).__name__})")
+        await message.answer(f"❌ I couldn't ban that user. Check my admin permissions.\n{type(e).__name__}")
 
 
 @dp.message(Command("unban"))
 async def unban_command(message: Message):
     if not await require_admin(message): return
-    args = (message.text or "").split()
-    target_id = None
-    if len(args) > 1 and args[1].lstrip("-").isdigit():
-        target_id = int(args[1])
-    elif message.reply_to_message and message.reply_to_message.from_user:
-        target_id = message.reply_to_message.from_user.id
-    if target_id is None:
-        await message.reply("Usage: /unban USER_ID (or reply to a user's message if available).")
-        return
+    target = await replied_target(message)
+    if not target: return
     try:
-        await bot.unban_chat_member(message.chat.id, target_id, only_if_banned=True)
-        await message.answer(f"✅ Unbanned user ID {target_id} (if they were banned).")
+        await bot.unban_chat_member(message.chat.id, target.id, only_if_banned=True)
+        await message.answer(f"✅ Unbanned {target.full_name} (if they were banned).")
     except Exception:
-        await message.answer("❌ Unban failed. Check my admin permissions and the user ID.")
+        await message.answer("❌ I couldn't unban that user. Check my admin permissions.")
 
 
 @dp.message(Command("kick"))
 async def kick_command(message: Message):
     if not await require_admin(message): return
-    target = await admin_target(message)
+    target = await replied_target(message)
     if not target: return
     try:
         await bot.ban_chat_member(message.chat.id, target.id)
         await bot.unban_chat_member(message.chat.id, target.id, only_if_banned=True)
-        await message.answer(f"👢 Kicked {escape(target.full_name)}.")
+        await message.answer(f"👢 Kicked {target.full_name}.")
     except Exception:
-        await message.answer("❌ Kick failed. Check my admin permissions.")
+        await message.answer("❌ I couldn't kick that user. Check my admin permissions.")
 
 
 @dp.message(Command("mute"))
 async def mute_command(message: Message):
     if not await require_admin(message): return
-    target = await admin_target(message)
+    target = await replied_target(message)
     if not target: return
-    args = (message.text or "").split()
-    minutes = MUTE_MINUTES_DEFAULT
-    if len(args) > 1:
-        try: minutes = max(1, min(10080, int(args[1])))
-        except ValueError:
-            await message.reply("Usage: reply with /mute [minutes]. Example: /mute 30")
-            return
     try:
-        until = datetime.now(timezone.utc) + timedelta(minutes=minutes)
-        await bot.restrict_chat_member(message.chat.id, target.id, permissions=ChatPermissions(can_send_messages=False), until_date=until)
-        await message.answer(f"🔇 Muted {escape(target.full_name)} for {minutes} minute(s).")
+        from datetime import datetime, timedelta, timezone
+        until = datetime.now(timezone.utc) + timedelta(minutes=MUTE_MINUTES_DEFAULT)
+        from aiogram.types import ChatPermissions
+        await bot.restrict_chat_member(
+            message.chat.id, target.id, permissions=ChatPermissions(can_send_messages=False),
+            until_date=until
+        )
+        await message.answer(f"🔇 Muted {target.full_name} for {MUTE_MINUTES_DEFAULT} minutes.")
     except Exception:
-        await message.answer("❌ Mute failed. Check that I'm an admin with restrict-member rights.")
+        await message.answer("❌ I couldn't mute that user. Check my admin permissions.")
 
 
 @dp.message(Command("unmute"))
 async def unmute_command(message: Message):
     if not await require_admin(message): return
-    target = await admin_target(message)
+    target = await replied_target(message)
     if not target: return
     try:
-        await bot.restrict_chat_member(message.chat.id, target.id, permissions=ChatPermissions(
-            can_send_messages=True, can_send_audios=True, can_send_documents=True, can_send_photos=True,
-            can_send_videos=True, can_send_video_notes=True, can_send_voice_notes=True, can_send_polls=True,
-            can_send_other_messages=True, can_add_web_page_previews=True
-        ))
-        await message.answer(f"🔊 Unmuted {escape(target.full_name)}.")
+        from aiogram.types import ChatPermissions
+        await bot.restrict_chat_member(
+            message.chat.id, target.id,
+            permissions=ChatPermissions(
+                can_send_messages=True, can_send_audios=True, can_send_documents=True,
+                can_send_photos=True, can_send_videos=True, can_send_video_notes=True,
+                can_send_voice_notes=True, can_send_polls=True, can_send_other_messages=True,
+                can_add_web_page_previews=True
+            )
+        )
+        await message.answer(f"🔊 Unmuted {target.full_name}.")
     except Exception:
-        await message.answer("❌ Unmute failed. Check my admin permissions.")
+        await message.answer("❌ I couldn't unmute that user. Check my admin permissions.")
 
 
 @dp.message(Command("warn"))
 async def warn_command(message: Message):
     if not await require_admin(message): return
-    target = await admin_target(message)
+    target = await replied_target(message)
     if not target: return
-    count = warning_count(message.chat.id, target.id) + 1
-    set_warning_count(message.chat.id, target.id, count)
-    reason = (message.text or "").partition(" ")[2].strip()
-    suffix = f" Reason: {escape(reason)}" if reason else ""
+    key = (message.chat.id, target.id)
+    WARNINGS[key] = WARNINGS.get(key, 0) + 1
+    count = WARNINGS[key]
     if count >= 3:
         try:
             await bot.ban_chat_member(message.chat.id, target.id)
             await bot.unban_chat_member(message.chat.id, target.id, only_if_banned=True)
-            set_warning_count(message.chat.id, target.id, 0)
-            await message.answer(f"🚫 {escape(target.full_name)} reached 3 warnings and was kicked.{suffix}")
+            WARNINGS[key] = 0
+            await message.answer(f"🚫 {target.full_name} reached 3 warnings and was kicked.")
         except Exception:
-            await message.answer(f"⚠️ {escape(target.full_name)} has {count}/3 warnings, but I couldn't kick them. Check my permissions.")
+            await message.answer(f"⚠️ {target.full_name} has {count}/3 warnings. I couldn't kick them; check my admin permissions.")
     else:
-        await message.answer(f"⚠️ Warned {escape(target.full_name)}: {count}/3.{suffix}")
+        await message.answer(f"⚠️ Warned {target.full_name}: {count}/3. Three warnings trigger a kick.")
 
 
 @dp.message(Command("warnings"))
 async def warnings_command(message: Message):
-    if not await require_admin(message): return
-    target = await admin_target(message)
+    target = await replied_target(message)
     if not target: return
-    await message.answer(f"⚠️ {escape(target.full_name)} has {warning_count(message.chat.id, target.id)}/3 warning(s).")
-
-
-@dp.message(Command("resetwarnings"))
-async def resetwarnings_command(message: Message):
-    if not await require_admin(message): return
-    target = await admin_target(message)
-    if not target: return
-    set_warning_count(message.chat.id, target.id, 0)
-    await message.answer(f"✅ Warnings reset for {escape(target.full_name)}.")
-
-
-@dp.message(Command("promote"))
-async def promote_command(message: Message):
-    if not await require_admin(message): return
-    target = await admin_target(message)
-    if not target: return
-    try:
-        await bot.promote_chat_member(message.chat.id, target.id, can_manage_chat=True, can_delete_messages=True,
-            can_manage_video_chats=True, can_restrict_members=True, can_promote_members=False,
-            can_change_info=False, can_invite_users=True, can_pin_messages=True, can_post_stories=False,
-            can_edit_stories=False, can_delete_stories=False)
-        await message.answer(f"👑 Promoted {escape(target.full_name)} with standard moderation rights. Adjust specific rights in Telegram if needed.")
-    except Exception:
-        await message.answer("❌ Promote failed. I need admin status and promote-members permission; Telegram may restrict which rights I can grant.")
-
-
-@dp.message(Command("demote"))
-async def demote_command(message: Message):
-    if not await require_admin(message): return
-    target = await admin_target(message)
-    if not target: return
-    try:
-        await bot.promote_chat_member(message.chat.id, target.id, can_manage_chat=False, can_delete_messages=False,
-            can_manage_video_chats=False, can_restrict_members=False, can_promote_members=False,
-            can_change_info=False, can_invite_users=False, can_pin_messages=False, can_post_stories=False,
-            can_edit_stories=False, can_delete_stories=False)
-        await message.answer(f"⬇️ Demoted {escape(target.full_name)} if Telegram permits this action.")
-    except Exception:
-        await message.answer("❌ Demote failed. Check my promote-members permission and target's admin status.")
-
-
-@dp.message(Command("pin"))
-async def pin_command(message: Message):
-    if not await require_admin(message): return
-    if not message.reply_to_message:
-        await message.reply("Reply to a message with /pin."); return
-    try:
-        await bot.pin_chat_message(message.chat.id, message.reply_to_message.message_id)
-        await message.answer("📌 Message pinned.")
-    except Exception:
-        await message.answer("❌ Pin failed. Check my pin-message permission.")
-
-
-@dp.message(Command("unpin"))
-async def unpin_command(message: Message):
-    if not await require_admin(message): return
-    try:
-        if message.reply_to_message:
-            await bot.unpin_chat_message(message.chat.id, message.reply_to_message.message_id)
-        else:
-            await bot.unpin_chat_message(message.chat.id)
-        await message.answer("📌 Message unpinned.")
-    except Exception:
-        await message.answer("❌ Unpin failed. Check my pin-message permission.")
-
-
-@dp.message(Command("del", "delete"))
-async def delete_command(message: Message):
-    if not await require_admin(message): return
-    if not message.reply_to_message:
-        await message.reply("Reply to a message with /del."); return
-    try:
-        await bot.delete_message(message.chat.id, message.reply_to_message.message_id)
-        try: await message.delete()
-        except Exception: pass
-    except Exception:
-        await message.answer("❌ Delete failed. Check my delete-message permission; old messages may be undeletable.")
-
-
-@dp.message(Command("purge"))
-async def purge_command(message: Message):
-    if not await require_admin(message): return
-    if not message.reply_to_message:
-        await message.reply("Reply to the first message to remove, then use /purge [1-50]."); return
-    args = (message.text or "").split()
-    try: count = max(1, min(50, int(args[1]))) if len(args) > 1 else 10
-    except ValueError:
-        await message.reply("Usage: reply to a message and use /purge [1-50]."); return
-    first_id = message.reply_to_message.message_id
-    deleted = 0
-    for mid in range(first_id, min(first_id + count, message.message_id)):
-        try:
-            await bot.delete_message(message.chat.id, mid); deleted += 1
-        except Exception:
-            pass
-    try: await message.delete()
-    except Exception: pass
-    status = await message.answer(f"🧹 Purge finished: deleted {deleted} message(s).")
-    await asyncio.sleep(4)
-    try: await status.delete()
-    except Exception: pass
-
-
-@dp.message(Command("close", "lock"))
-async def close_command(message: Message):
-    if not await require_admin(message): return
-    try:
-        await bot.set_chat_permissions(message.chat.id, ChatPermissions(can_send_messages=False))
-        await message.answer("🔒 Group chat locked for members.")
-    except Exception:
-        await message.answer("❌ Lock failed. Check my change-chat-permissions rights.")
-
-
-@dp.message(Command("open", "unlock"))
-async def open_command(message: Message):
-    if not await require_admin(message): return
-    try:
-        await bot.set_chat_permissions(message.chat.id, ChatPermissions(
-            can_send_messages=True, can_send_audios=True, can_send_documents=True, can_send_photos=True,
-            can_send_videos=True, can_send_video_notes=True, can_send_voice_notes=True, can_send_polls=True,
-            can_send_other_messages=True, can_add_web_page_previews=True, can_invite_users=True,
-            can_pin_messages=False, can_change_info=False
-        ))
-        await message.answer("🔓 Group chat unlocked. Note: Telegram applies the permissions you set here as group defaults.")
-    except Exception:
-        await message.answer("❌ Unlock failed. Check my change-chat-permissions rights.")
-
-
-@dp.message(Command("adminlist"))
-async def adminlist_command(message: Message):
-    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-        await message.reply("Use this in a group."); return
-    try:
-        admins = await bot.get_chat_administrators(message.chat.id)
-        lines = [f"• {escape(a.user.full_name)} (@{escape(a.user.username)})" if a.user.username else f"• {escape(a.user.full_name)}" for a in admins]
-        await message.answer("👑 Group admins:\n" + "\n".join(lines))
-    except Exception:
-        await message.answer("❌ Couldn't fetch the admin list.")
-
-
-@dp.message(Command("id"))
-async def id_command(message: Message):
-    lines = [f"Chat ID: {message.chat.id}"]
-    if message.reply_to_message and message.reply_to_message.from_user:
-        u = message.reply_to_message.from_user
-        lines.append(f"User ID: {u.id}")
-    elif message.from_user:
-        lines.append(f"Your user ID: {message.from_user.id}")
-    await message.reply("🆔 " + "\n".join(lines))
+    count = WARNINGS.get((message.chat.id, target.id), 0)
+    await message.answer(f"⚠️ {target.full_name} has {count}/3 warning(s) in this running session.")
 
 
 @dp.message(
@@ -1035,32 +896,10 @@ async def main():
         BotCommand(command="truth", description="Truth question"),
         BotCommand(command="dare", description="Get a dare"),
         BotCommand(command="riddle", description="Get a riddle"),
-        BotCommand(command="quiz", description="Play a quick quiz"),
-        BotCommand(command="ai", description="Chat with AI"),
-        BotCommand(command="memory", description="View what I remember in this chat"),
-        BotCommand(command="forgetme", description="Clear your AI memory in this chat"),
-        BotCommand(command="ban", description="Ban a replied-to user"),
-        BotCommand(command="unban", description="Unban by user ID"),
-        BotCommand(command="kick", description="Kick a replied-to user"),
-        BotCommand(command="mute", description="Mute a user; optional minutes"),
-        BotCommand(command="unmute", description="Unmute a user"),
-        BotCommand(command="warn", description="Warn a user"),
-        BotCommand(command="warnings", description="Check a user's warnings"),
-        BotCommand(command="resetwarnings", description="Reset a user's warnings"),
-        BotCommand(command="promote", description="Promote a replied-to user"),
-        BotCommand(command="demote", description="Demote a replied-to admin"),
-        BotCommand(command="pin", description="Pin a replied-to message"),
-        BotCommand(command="unpin", description="Unpin a message"),
-        BotCommand(command="del", description="Delete a replied-to message"),
-        BotCommand(command="purge", description="Delete a batch of messages"),
-        BotCommand(command="close", description="Lock group messaging"),
-        BotCommand(command="open", description="Unlock group messaging"),
-        BotCommand(command="adminlist", description="List group admins"),
-        BotCommand(command="id", description="Show chat/user ID"),
+        BotCommand(command="quiz", description="Set up a timed category quiz"),
+        BotCommand(command="ai", description="Ask AI"),
     ]
     await bot.set_my_commands(commands)
-    init_database()
-    log.info("Persistent memory database: %s", MEMORY_DB_PATH)
     runner = await start_http_server()
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
