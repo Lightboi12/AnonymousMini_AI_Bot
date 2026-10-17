@@ -12,7 +12,7 @@ from aiogram.enums import ChatType
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton as _InlineKeyboardButton,
-    ChatMember, BotCommand, ChatJoinRequest, TelegramObject
+    ChatMember, BotCommand, ChatJoinRequest, TelegramObject, PollAnswer, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats
 )
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from typing import Callable, Awaitable, Any
@@ -108,6 +108,7 @@ AI_HISTORY_TURNS = 8
 QUIZ_SETUP = {}  # setup progress keyed by chat and user
 ACTIVE_QUIZZES = {}  # one live quiz per chat
 QUIZ_TIMERS = {}
+POLL_TO_QUIZ = {}  # poll_id -> (chat_id, round_index)
 
 
 def main_menu() -> InlineKeyboardMarkup:
@@ -551,94 +552,84 @@ async def quiz_setup_callback(callback: CallbackQuery):
     await callback.answer()
 
 
-async def send_quiz_question(chat_id: int, message_id: int):
+async def send_quiz_question(chat_id: int, message_id: int = 0):
+    """Send each round as a native Telegram quiz poll, like the reference screenshot."""
     quiz_state = ACTIVE_QUIZZES.get(chat_id)
     if not quiz_state:
         return
     idx = quiz_state["index"]
     if idx >= len(quiz_state["questions"]):
-        score_lines = sorted(quiz_state["scores"].items(), key=lambda item: (-item[1], item[0]))
-        leaderboard = "\\n".join(f"{i+1}. {name}: {score}/{len(quiz_state['questions'])}" for i, (name, score) in enumerate(score_lines[:10])) or "No answers recorded."
+        score_lines = sorted(quiz_state["scores"].items(), key=lambda item: (-item[1], item[0].casefold()))
+        leaderboard = "\n".join(f"{i+1}. {name}: {score}/{len(quiz_state['questions'])}" for i, (name, score) in enumerate(score_lines[:10])) or "No answers recorded."
         try:
-            await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=f"🏁 QUIZ FINISHED!\\n{quiz_state['category']} · {len(quiz_state['questions'])} rounds\\n\\n🏆 Scores\\n{leaderboard}")
-        except TelegramBadRequest:
-            pass
+            await bot.send_message(chat_id, f"🏁 <b>QUIZ FINISHED!</b>\n{html_lib.escape(quiz_state['category'])} · {len(quiz_state['questions'])} rounds\n\n🏆 <b>Scores</b>\n{html_lib.escape(leaderboard)}", parse_mode="HTML")
+        except Exception:
+            log.exception("Could not send quiz results")
         ACTIVE_QUIZZES.pop(chat_id, None)
         return
     category, difficulty, question, options, correct = quiz_state["questions"][idx]
     quiz_state["answers"] = {}
-    buttons = [[InlineKeyboardButton(text=opt, callback_data=f"qans:{idx}:{i}")] for i, opt in enumerate(options)]
-    text = (f"🧠 {category} · {difficulty} · Round {idx+1}/{len(quiz_state['questions'])}\\n"
-            f"⏱ Time: {quiz_state['seconds']} seconds\\n\\n{question}\\n\\nChoose your answer before time runs out.")
+    title = f"{category} · {difficulty} · Round {idx+1}/{len(quiz_state['questions'])} · +{15 if difficulty == 'Hard' else 10} aura"
+    poll_question = f"{title}\n\n{question}"
+    if len(poll_question) > 300:
+        poll_question = poll_question[:297] + "..."
     try:
-        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-    except TelegramBadRequest:
-        return
-    task = asyncio.create_task(quiz_question_timer(chat_id, message_id, idx))
-    quiz_state["task"] = task
+        sent = await bot.send_poll(
+            chat_id=chat_id,
+            question=poll_question,
+            options=[str(opt)[:100] for opt in options],
+            type="quiz",
+            correct_option_id=correct,
+            is_anonymous=False,
+            open_period=int(quiz_state["seconds"]),
+            explanation=f"Correct answer: {options[correct]}",
+        )
+        POLL_TO_QUIZ[sent.poll.id] = (chat_id, idx)
+        quiz_state["poll_id"] = sent.poll.id
+        quiz_state["task"] = asyncio.create_task(quiz_question_timer(chat_id, sent.message_id, idx))
+    except Exception:
+        log.exception("Could not send native Telegram quiz poll")
+        await bot.send_message(chat_id, "I couldn't send the quiz poll. Make sure polls are allowed in this chat and try /quiz again.")
 
 
-@dp.callback_query(F.data.startswith("qans:"))
-async def quiz_answer(callback: CallbackQuery):
-    if not callback.message or not callback.from_user:
-        await callback.answer()
+@dp.poll_answer()
+async def quiz_poll_answer(answer: PollAnswer):
+    mapping = POLL_TO_QUIZ.get(answer.poll_id)
+    if not mapping or not answer.user or not answer.option_ids:
         return
-    quiz_state = ACTIVE_QUIZZES.get(callback.message.chat.id)
-    if not quiz_state:
-        await callback.answer("This quiz has ended.", show_alert=True)
+    chat_id, idx = mapping
+    state = ACTIVE_QUIZZES.get(chat_id)
+    if not state or state.get("index") != idx:
         return
-    parts = callback.data.split(":")
-    idx, chosen = int(parts[1]), int(parts[2])
-    if idx != quiz_state["index"]:
-        await callback.answer("That question has expired.", show_alert=True)
-        return
-    user_id = callback.from_user.id
-    quiz_state["answers"][user_id] = chosen
-    await callback.answer("Answer locked in! The correct answer is revealed when time runs out.")
+    _, _, _, options, correct = state["questions"][idx]
+    state["answers"][answer.user.id] = {
+        "name": answer.user.full_name,
+        "chosen": answer.option_ids[0],
+    }
 
 
 async def quiz_question_timer(chat_id: int, message_id: int, idx: int):
     try:
-        await asyncio.sleep(ACTIVE_QUIZZES[chat_id]["seconds"])
+        state = ACTIVE_QUIZZES.get(chat_id)
+        if not state:
+            return
+        await asyncio.sleep(state["seconds"] + 2)  # allow Telegram to close the poll and publish final results
         state = ACTIVE_QUIZZES.get(chat_id)
         if not state or state["index"] != idx:
             return
-        category, difficulty, question, options, correct = state["questions"][idx]
-        # Score each player's final submitted answer for this round.
-        for user_id, chosen in state["answers"].items():
-            member = await bot.get_chat_member(chat_id, user_id)
-            name = member.user.full_name if member and member.user else str(user_id)
-            state["scores"][name] = state["scores"].get(name, 0) + (1 if chosen == correct else 0)
-        result = (f"⏰ TIME'S UP! · Round {idx+1}/{len(state['questions'])}\\n\\n{question}\\n\\n"
-                  f"✅ Correct answer: {options[correct]}\\n\\n")
-        if state["answers"]:
-            result += f"Answers received: {len(state['answers'])} player(s).\\n"
-        else:
-            result += "Nobody answered in time.\\n"
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Next question ➡️", callback_data=f"qnext:{idx}")]])
-        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=result, reply_markup=keyboard)
+        _, _, _, options, correct = state["questions"][idx]
+        for answer in state["answers"].values():
+            name = answer["name"]
+            state["scores"][name] = state["scores"].get(name, 0) + (1 if answer["chosen"] == correct else 0)
+        if not state["answers"]:
+            await bot.send_message(chat_id, f"⏰ Round {idx+1} ended — nobody answered.\n✅ Correct answer: {options[correct]}")
+        POLL_TO_QUIZ.pop(state.get("poll_id"), None)
+        state["index"] += 1
+        await send_quiz_question(chat_id)
     except asyncio.CancelledError:
         return
     except Exception:
-        log.exception("Quiz timer failed")
-
-
-@dp.callback_query(F.data.startswith("qnext:"))
-async def quiz_next(callback: CallbackQuery):
-    if not callback.message:
-        await callback.answer()
-        return
-    state = ACTIVE_QUIZZES.get(callback.message.chat.id)
-    if not state:
-        await callback.answer("This quiz has ended.", show_alert=True)
-        return
-    idx = int(callback.data.split(":", 1)[1])
-    if idx != state["index"]:
-        await callback.answer("This question has already moved on.", show_alert=True)
-        return
-    state["index"] += 1
-    await callback.answer()
-    await send_quiz_question(callback.message.chat.id, callback.message.message_id)
+        log.exception("Quiz poll timer failed")
 
 
 @dp.message(Command("ship"))
@@ -1075,9 +1066,14 @@ async def main():
         BotCommand(command="list", description="List pending join requests: /list pending"),
         BotCommand(command="approve", description="Approve pending join request"),
         BotCommand(command="decline", description="Decline pending join request"),
+        BotCommand(command="stats", description="Owner bot statistics"),
+        BotCommand(command="broadcast", description="Owner announcement broadcast"),
         BotCommand(command="ai", description="Ask AI"),
     ]
-    await bot.set_my_commands(commands)
+    # Telegram has separate command menus for groups and private chats.
+    await bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats())
+    group_commands = commands[:]
+    await bot.set_my_commands(group_commands, scope=BotCommandScopeAllGroupChats())
     runner = await start_http_server()
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
