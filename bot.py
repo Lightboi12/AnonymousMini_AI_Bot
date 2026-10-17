@@ -3,15 +3,19 @@ import logging
 import os
 import random
 import time
+import sqlite3
+import html as html_lib
+from datetime import datetime, timezone
 from aiohttp import web
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.enums import ChatType
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    ChatMember, BotCommand
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton as _InlineKeyboardButton,
+    ChatMember, BotCommand, ChatJoinRequest, TelegramObject
 )
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from typing import Callable, Awaitable, Any
 from aiogram.utils.chat_action import ChatActionSender
 
 # Anonymous™ Mini — refreshed menu, fun commands, and optional AI.
@@ -28,7 +32,49 @@ log = logging.getLogger("anonymous-mini")
 TOKEN = os.getenv("TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 PORT = int(os.getenv("PORT", "10000"))
+OWNER_ID = int(os.getenv("OWNER_ID", "0") or "0")
+DATABASE_PATH = os.getenv("DATABASE_PATH", "anonymous_mini.sqlite3")
 
+
+# Telegram Bot API 9.4 button styles: blue primary, green success, red danger.
+def InlineKeyboardButton(**kwargs):
+    if "style" not in kwargs:
+        label = str(kwargs.get("text", "")).lower()
+        if any(word in label for word in ("cancel", "decline", "delete", "stop", "ban")):
+            kwargs["style"] = "danger"
+        elif any(word in label for word in ("start", "approve", "next", "yes", "join")):
+            kwargs["style"] = "success"
+        else:
+            kwargs["style"] = "primary"
+    return _InlineKeyboardButton(**kwargs)
+
+# Persistent audience and pending join-request tracking.
+def init_database():
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, private_chat_id INTEGER, first_seen TEXT NOT NULL, last_seen TEXT NOT NULL)")
+        conn.execute("CREATE TABLE IF NOT EXISTS chats (chat_id INTEGER PRIMARY KEY, chat_type TEXT NOT NULL, title TEXT, first_seen TEXT NOT NULL, last_seen TEXT NOT NULL)")
+        conn.execute("CREATE TABLE IF NOT EXISTS pending_join_requests (chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL, username TEXT, full_name TEXT, created_at TEXT NOT NULL, PRIMARY KEY(chat_id,user_id))")
+        conn.commit()
+
+def db_track_message(message: Message):
+    now = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        if message.from_user and not message.from_user.is_bot:
+            private_id = message.chat.id if message.chat.type == ChatType.PRIVATE else None
+            conn.execute("INSERT INTO users(user_id,private_chat_id,first_seen,last_seen) VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET private_chat_id=COALESCE(excluded.private_chat_id,users.private_chat_id), last_seen=excluded.last_seen", (message.from_user.id, private_id, now, now))
+        title = message.chat.title or message.chat.full_name or message.chat.username or str(message.chat.id)
+        conn.execute("INSERT INTO chats(chat_id,chat_type,title,first_seen,last_seen) VALUES(?,?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET chat_type=excluded.chat_type,title=excluded.title,last_seen=excluded.last_seen", (message.chat.id, message.chat.type, title, now, now))
+        conn.commit()
+
+class TrackingMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        if isinstance(event, Message):
+            try: db_track_message(event)
+            except Exception: log.exception("Audience tracking failed")
+        return await handler(event, data)
+
+def owner_only(message: Message) -> bool:
+    return bool(OWNER_ID and message.from_user and message.from_user.id == OWNER_ID)
 
 # Founder identity: the displayed name is clickable and opens the Telegram profile.
 FOUNDER_NAME = "𝐋 𝐎 𝐑 𝐃 ♰ 𝐀𝐍𝐎𝐍𝐘𝐌𝐎𝐔𝐒™"
@@ -226,6 +272,31 @@ QUIZ_QUESTIONS = [
     ("Sport & Leisure", "Hard", "In tennis, what score comes after deuce when a player wins the next point?", ["Game", "Advantage", "Love", "Set"], 1),
 ]
 QUIZ_CATEGORIES = ["Arts & Literature", "Film & TV", "Food & Drink", "General Knowledge", "Geography", "History", "Music", "Science", "Society & Culture", "Sport & Leisure"]
+OPENTDB_CATEGORY_IDS = {"Arts & Literature": 25, "Film & TV": 11, "General Knowledge": 9, "Geography": 22, "History": 23, "Music": 12, "Science": 17, "Sport & Leisure": 21}
+
+async def fetch_question_pool(category: str, difficulty: str):
+    """Fetch a fresh randomized pool from Open Trivia DB; fall back to curated questions."""
+    import aiohttp
+    params = {"amount": 50, "type": "multiple"}
+    if category in OPENTDB_CATEGORY_IDS: params["category"] = OPENTDB_CATEGORY_IDS[category]
+    if difficulty != "Any": params["difficulty"] = difficulty.lower()
+    try:
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get("https://opentdb.com/api.php", params=params) as response:
+                payload = await response.json(content_type=None)
+        if payload.get("response_code") == 0:
+            pool = []
+            for item in payload.get("results", []):
+                question = html_lib.unescape(item["question"])
+                correct = html_lib.unescape(item["correct_answer"])
+                options = [html_lib.unescape(x) for x in item["incorrect_answers"]] + [correct]
+                random.shuffle(options)
+                pool.append((category, difficulty if difficulty != "Any" else item.get("difficulty", "medium").title(), question, options, options.index(correct)))
+            if pool: return pool
+    except Exception as exc:
+        log.warning("External quiz pool unavailable: %s", type(exc).__name__)
+    return [q for q in QUIZ_QUESTIONS if q[0] == category and (difficulty == "Any" or q[1] == difficulty)]
 
 EIGHT_BALL = [
     "🎱 Yes, definitely.", "🎱 No doubt about it.", "🎱 Ask again later.",
@@ -458,20 +529,20 @@ async def quiz_setup_callback(callback: CallbackQuery):
         old = ACTIVE_QUIZZES.get(chat_id)
         if old and old.get("task"):
             old["task"].cancel()
-        pool = [q for q in QUIZ_QUESTIONS if q[0] == state["category"] and (state["difficulty"] == "Any" or q[1] == state["difficulty"])]
+        await callback.message.edit_text("🔎 Building a fresh question pool…")
+        pool = await fetch_question_pool(state["category"], state["difficulty"])
         if not pool:
-            await callback.message.edit_text("I don't have enough verified questions for that selection yet. Try Difficulty: Any.")
+            await callback.message.edit_text("I couldn't load questions for that selection right now. Please try again in a moment or choose Difficulty: Any.")
             await callback.answer()
             return
         rounds = state["rounds"]
-        # Build the requested number of rounds. Prefer unique questions first; if the selected
-        # category/difficulty has a smaller bank, reshuffle the bank for extra rounds.
-        questions = []
-        while len(questions) < rounds:
-            batch = random.sample(pool, len(pool))
-            if questions and len(batch) > 1 and batch[0] == questions[-1]:
-                batch[0], batch[1] = batch[1], batch[0]
-            questions.extend(batch[:rounds - len(questions)])
+        # Never repeat a question inside a quiz. If the available pool is smaller than the requested rounds, explain instead of recycling questions.
+        unique_pool = list({(q[0], q[1], q[2]): q for q in pool}.values())
+        if len(unique_pool) < rounds:
+            await callback.message.edit_text(f"I found only {len(unique_pool)} unique questions for that selection, but you requested {rounds} rounds. Choose Difficulty: Any or a different category so I can build a larger pool.")
+            await callback.answer()
+            return
+        questions = random.sample(unique_pool, rounds)
         ACTIVE_QUIZZES[chat_id] = {"owner": callback.from_user.id, "starter": state["starter"], "category": state["category"], "difficulty": state["difficulty"], "seconds": state["seconds"], "questions": questions, "index": 0, "scores": {}, "answers": {}, "message_id": callback.message.message_id, "task": None}
         await callback.answer("Quiz starting!")
         await send_quiz_question(chat_id, callback.message.message_id)
@@ -854,6 +925,108 @@ async def game_and_group_ai_handler(message: Message):
     await ask_ai(message, prompt)
 
 
+@dp.chat_join_request()
+async def track_join_request(request: ChatJoinRequest):
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        with sqlite3.connect(DATABASE_PATH) as conn:
+            conn.execute("INSERT OR REPLACE INTO pending_join_requests(chat_id,user_id,username,full_name,created_at) VALUES(?,?,?,?,?)", (request.chat.id, request.from_user.id, request.from_user.username, request.from_user.full_name, now))
+            conn.execute("INSERT INTO chats(chat_id,chat_type,title,first_seen,last_seen) VALUES(?,?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET last_seen=excluded.last_seen", (request.chat.id, request.chat.type, request.chat.title or str(request.chat.id), now, now))
+            conn.commit()
+    except Exception:
+        log.exception("Could not save join request")
+
+async def pending_rows(chat_id: int):
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        return conn.execute("SELECT user_id, username, full_name, created_at FROM pending_join_requests WHERE chat_id=? ORDER BY created_at", (chat_id,)).fetchall()
+
+@dp.message(Command("list"))
+async def list_pending_command(message: Message):
+    parts = (message.text or "").split()
+    if len(parts) < 2 or parts[1].lower() != "pending":
+        return
+    if not await require_admin(message):
+        return
+    rows = await pending_rows(message.chat.id)
+    if not rows:
+        await message.answer("📭 No tracked pending join requests for this group.")
+        return
+    lines = ["⏳ Pending join requests:"]
+    for user_id, username, full_name, created_at in rows[:50]:
+        who = f"@{username}" if username else (full_name or "Unknown user")
+        lines.append(f"• {who} — ID: <code>{user_id}</code>")
+    lines.append("\nApprove: /approve pending USER_ID\nDecline: /decline pending USER_ID")
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+async def process_pending_request(message: Message, approve: bool):
+    if not await require_admin(message):
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 3 or parts[1].lower() != "pending" or not parts[2].isdigit():
+        usage = "/approve pending USER_ID" if approve else "/decline pending USER_ID"
+        await message.answer(f"Usage: {usage}\nUse /list pending to see tracked requests.")
+        return
+    user_id = int(parts[2])
+    try:
+        if approve:
+            await bot.approve_chat_join_request(chat_id=message.chat.id, user_id=user_id)
+        else:
+            await bot.decline_chat_join_request(chat_id=message.chat.id, user_id=user_id)
+        with sqlite3.connect(DATABASE_PATH) as conn:
+            conn.execute("DELETE FROM pending_join_requests WHERE chat_id=? AND user_id=?", (message.chat.id, user_id))
+            conn.commit()
+        verb = "Approved" if approve else "Declined"
+        await message.answer(f"✅ {verb} join request for <code>{user_id}</code>.", parse_mode="HTML")
+    except Exception as exc:
+        action = "approve" if approve else "decline"
+        await message.answer(f"Couldn't {action} that request. Ensure the bot is an admin with invite-user permissions and the request is still pending. ({type(exc).__name__})")
+
+@dp.message(Command("approve"))
+async def approve_pending_command(message: Message):
+    await process_pending_request(message, True)
+
+@dp.message(Command("decline"))
+async def decline_pending_command(message: Message):
+    await process_pending_request(message, False)
+
+@dp.message(Command("stats", "botstats"))
+async def owner_stats_command(message: Message):
+    if not owner_only(message):
+        await message.answer("⛔ Owner-only command.")
+        return
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        dm_users = conn.execute("SELECT COUNT(DISTINCT user_id) FROM users WHERE private_chat_id IS NOT NULL").fetchone()[0]
+        group_count = conn.execute("SELECT COUNT(*) FROM chats WHERE chat_type IN ('group','supergroup')").fetchone()[0]
+        channel_count = conn.execute("SELECT COUNT(*) FROM chats WHERE chat_type='channel'").fetchone()[0]
+        users_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    await message.answer(
+        f"👑 <b>Anonymous™ Mini — Owner Stats</b>\n\n👤 Unique users seen: <b>{users_count}</b>\n"
+        f"💬 Users who opened/used the bot in DMs: <b>{dm_users}</b>\n👥 Groups/supergroups seen: <b>{group_count}</b>\n"
+        f"📣 Channels seen: <b>{channel_count}</b>\n\n<i>Counts are based on chats/messages the bot has actually received since this database was enabled.</i>",
+        parse_mode="HTML")
+
+@dp.message(Command("broadcast"))
+async def owner_broadcast_command(message: Message):
+    if not owner_only(message):
+        await message.answer("⛔ Owner-only command.")
+        return
+    announcement = (message.text or "").partition(" ")[2].strip()
+    if not announcement:
+        await message.answer("Usage: /broadcast Your announcement goes here\nThis sends the announcement to every tracked private user and group.")
+        return
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        targets = {row[0] for row in conn.execute("SELECT private_chat_id FROM users WHERE private_chat_id IS NOT NULL").fetchall()}
+        targets.update(row[0] for row in conn.execute("SELECT chat_id FROM chats WHERE chat_type IN ('group','supergroup')").fetchall())
+    sent = failed = 0
+    for target in targets:
+        try:
+            await bot.send_message(target, "📢 <b>Announcement from Anonymous™ Mini</b>\n\n" + html_lib.escape(announcement), parse_mode="HTML")
+            sent += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.04)
+    await message.answer(f"📣 Broadcast finished.\n✅ Sent: {sent}\n⚠️ Failed/unreachable: {failed}")
+
 async def health_handler(request):
     return web.json_response({
         "status": "ok",
@@ -877,6 +1050,8 @@ async def start_http_server():
 
 async def main():
     global bot_username
+    init_database()
+    dp.message.middleware(TrackingMiddleware())
     me = await bot.get_me()
     bot_username = me.username or ""
     log.info("Starting @%s", bot_username)
@@ -897,6 +1072,9 @@ async def main():
         BotCommand(command="dare", description="Get a dare"),
         BotCommand(command="riddle", description="Get a riddle"),
         BotCommand(command="quiz", description="Set up a timed category quiz"),
+        BotCommand(command="list", description="List pending join requests: /list pending"),
+        BotCommand(command="approve", description="Approve pending join request"),
+        BotCommand(command="decline", description="Decline pending join request"),
         BotCommand(command="ai", description="Ask AI"),
     ]
     await bot.set_my_commands(commands)
