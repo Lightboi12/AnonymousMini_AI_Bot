@@ -142,7 +142,9 @@ HELP_TEXT = (
     "• Use the buttons below to explore.\n"
     "• In groups, reply to a message when using moderation commands.\n"
     "• Group moderation commands generally require admin permissions.\n"
-    "• AI requires the OPENAI_API_KEY environment variable."
+    "• For /promote and /demote, reply to the target member’s message.\n"
+    "• The bot must be an admin with permission to add new administrators.\n"
+    "• AI uses your configured Gemini, Groq, Cerebras, and OpenRouter providers."
 )
 
 COMMANDS_TEXT = (
@@ -152,7 +154,9 @@ COMMANDS_TEXT = (
     "/help — Help and usage\n"
     "/commands — Show commands\n"
     "/about — About this bot\n"
-    "/ping — Check bot response\n\n"
+    "/ping — Check bot response\n"
+    "/promote — Promote the replied-to member (group admin)\n"
+    "/demote — Remove admin rights from the replied-to admin (group admin)\n\n"
     "😂 Fun\n"
     "/joke — Random joke\n"
     "/fact — Random fact\n"
@@ -330,6 +334,40 @@ async def replied_target(message: Message):
         await message.reply("🤖 I can't apply that action to a bot.")
         return None
     return target
+
+
+async def bot_can_promote_members(message: Message) -> bool:
+    """Check chat type and the bot's Telegram admin rights before promote/demote calls."""
+    if not message.chat or message.chat.type != ChatType.SUPERGROUP:
+        await message.reply(
+            "❌ Telegram only supports this promote/demote operation in a supergroup. "
+            "Convert this group to a supergroup (Telegram usually does this automatically for larger groups), "
+            "then try again."
+        )
+        return False
+    try:
+        me = await bot.get_me()
+        member = await bot.get_chat_member(message.chat.id, me.id)
+        if member.status not in ("administrator", "creator"):
+            await message.reply(
+                "❌ I am not a group administrator. Promote me to admin first, then enable "
+                "the permission to add new administrators (Manage/Promote admins)."
+            )
+            return False
+        if member.status != "creator" and not getattr(member, "can_promote_members", False):
+            await message.reply(
+                "❌ I am a group admin, but I do not have permission to add new administrators. "
+                "Open Group Settings → Administrators → Anonymous™ Mini and enable the “Add New Admins” / “Promote Members” permission. Then try again."
+            )
+            return False
+        return True
+    except Exception as exc:
+        log.warning("Could not verify bot admin rights: %s", type(exc).__name__)
+        await message.reply(
+            "❌ I couldn't verify my group permissions. Make sure I'm an administrator "
+            "with permission to add new administrators, then try again."
+        )
+        return False
 
 
 async def require_admin(message: Message) -> bool:
@@ -695,7 +733,7 @@ async def ask_ai(message: Message, prompt: str):
         return
     log.info("AI providers configured for this request: %s", ", ".join(name for name, _ in providers))
 
-    timeout_seconds = max(2.0, min(float(os.getenv("AI_PROVIDER_TIMEOUT_SECONDS", "4.5")), 10.0))
+    timeout_seconds = max(6.0, min(float(os.getenv("AI_PROVIDER_TIMEOUT_SECONDS", "12")), 20.0))
     last_error = None
     for provider_name, provider in providers:
         try:
@@ -805,6 +843,8 @@ async def promote_command(message: Message):
     target = await replied_target(message)
     if not target:
         return
+    if not await bot_can_promote_members(message):
+        return
     if message.from_user and target.id == message.from_user.id:
         await message.reply("⚠️ You cannot use /promote on yourself.")
         return
@@ -833,10 +873,20 @@ async def promote_command(message: Message):
         )
     except Exception as exc:
         detail = getattr(exc, "message", None) or str(exc)
+        detail_text = str(detail)
+        log.warning("Promote failed in chat %s for target %s (%s): %s",
+                    message.chat.id, target.id, type(exc).__name__, detail_text[:500])
+        if "CHAT_ADMIN_REQUIRED" in detail_text or "not enough rights" in detail_text.lower():
+            explanation = (
+                "Telegram rejected the admin change. Confirm Anonymous™ Mini has the specific "
+                "‘Add New Admins / Promote Members’ right, and that the target is not an admin "
+                "with a higher/equal rank than the bot. Telegram controls admin rank server-side."
+            )
+        else:
+            explanation = "Check the bot's admin permissions and the target member, then try again."
         await message.answer(
-            "❌ I couldn't promote that member. Make sure I'm an admin with the right to add administrators, "
-            "and that you have permission to manage this member.\n"
-            f"Details: {html_lib.escape(str(detail)[:400])}",
+            f"❌ I couldn't promote that member. {explanation}\n"
+            f"Telegram: {html_lib.escape(detail_text[:400])}",
             parse_mode="HTML",
         )
 
@@ -848,6 +898,8 @@ async def demote_command(message: Message):
         return
     target = await replied_target(message)
     if not target:
+        return
+    if not await bot_can_promote_members(message):
         return
     if message.from_user and target.id == message.from_user.id:
         await message.reply("⚠️ You cannot use /demote on yourself.")
@@ -881,10 +933,21 @@ async def demote_command(message: Message):
         await message.answer(f"✅ Removed administrator rights from <a href=\"tg://user?id={target.id}\">{html_lib.escape(target.full_name)}</a>.", parse_mode="HTML")
     except Exception as exc:
         detail = getattr(exc, "message", None) or str(exc)
+        detail_text = str(detail)
+        log.warning("Demote failed in chat %s for target %s (%s): %s",
+                    message.chat.id, target.id, type(exc).__name__, detail_text[:500])
+        if "CHAT_ADMIN_REQUIRED" in detail_text or "not enough rights" in detail_text.lower():
+            explanation = (
+                "Telegram rejected the admin change. Confirm Anonymous™ Mini has the specific "
+                "‘Add New Admins / Promote Members’ right, and that the target admin is not "
+                "ranked above the bot. The group owner or an admin with a higher rank may need "
+                "to change that person's status."
+            )
+        else:
+            explanation = "Check the bot's admin permissions and the target member, then try again."
         await message.answer(
-            "❌ I couldn't demote that administrator. Make sure I'm an admin with the right to add administrators, "
-            "and that you have permission to manage this member.\n"
-            f"Details: {html_lib.escape(str(detail)[:400])}",
+            f"❌ I couldn't demote that administrator. {explanation}\n"
+            f"Telegram: {html_lib.escape(detail_text[:400])}",
             parse_mode="HTML",
         )
 
@@ -1175,6 +1238,8 @@ async def main():
         BotCommand(command="commands", description="List commands"),
         BotCommand(command="about", description="About this bot"),
         BotCommand(command="ping", description="Check bot status"),
+        BotCommand(command="promote", description="Promote replied-to group member"),
+        BotCommand(command="demote", description="Demote replied-to group admin"),
         BotCommand(command="joke", description="Get a random joke"),
         BotCommand(command="fact", description="Get a random fact"),
         BotCommand(command="quote", description="Get a motivational quote"),
