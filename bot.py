@@ -767,6 +767,98 @@ async def unban_command(message: Message):
         await message.answer("❌ I couldn't unban that user. Check my admin permissions.")
 
 
+@dp.message(Command("promote"))
+async def promote_command(message: Message):
+    """Promote the replied-to group member to a standard moderator."""
+    if not await require_admin(message):
+        return
+    target = await replied_target(message)
+    if not target:
+        return
+    if message.from_user and target.id == message.from_user.id:
+        await message.reply("⚠️ You cannot use /promote on yourself.")
+        return
+    try:
+        await bot.promote_chat_member(
+            chat_id=message.chat.id,
+            user_id=target.id,
+            can_manage_chat=False,
+            can_change_info=False,
+            can_post_messages=False,
+            can_edit_messages=False,
+            can_delete_messages=True,
+            can_manage_video_chats=False,
+            can_restrict_members=True,
+            can_promote_members=False,
+            can_invite_users=True,
+            can_pin_messages=True,
+            can_manage_topics=False,
+            can_post_stories=False,
+            can_edit_stories=False,
+            can_delete_stories=False,
+        )
+        await message.answer(
+            f"✅ Promoted <a href=\"tg://user?id={target.id}\">{html_lib.escape(target.full_name)}</a> to group admin with standard moderation rights.",
+            parse_mode="HTML",
+        )
+    except Exception as exc:
+        detail = getattr(exc, "message", None) or str(exc)
+        await message.answer(
+            "❌ I couldn't promote that member. Make sure I'm an admin with the right to add administrators, "
+            "and that you have permission to manage this member.\n"
+            f"Details: {html_lib.escape(str(detail)[:400])}",
+            parse_mode="HTML",
+        )
+
+
+@dp.message(Command("demote"))
+async def demote_command(message: Message):
+    """Remove admin rights from the replied-to administrator."""
+    if not await require_admin(message):
+        return
+    target = await replied_target(message)
+    if not target:
+        return
+    if message.from_user and target.id == message.from_user.id:
+        await message.reply("⚠️ You cannot use /demote on yourself.")
+        return
+    try:
+        member = await bot.get_chat_member(message.chat.id, target.id)
+        if member.status not in ("administrator", "creator"):
+            await message.answer(f"ℹ️ {html_lib.escape(target.full_name)} is not a group administrator.", parse_mode="HTML")
+            return
+        if member.status == "creator":
+            await message.answer("❌ The group owner cannot be demoted by a bot.")
+            return
+        await bot.promote_chat_member(
+            chat_id=message.chat.id,
+            user_id=target.id,
+            can_manage_chat=False,
+            can_change_info=False,
+            can_post_messages=False,
+            can_edit_messages=False,
+            can_delete_messages=False,
+            can_manage_video_chats=False,
+            can_restrict_members=False,
+            can_promote_members=False,
+            can_invite_users=False,
+            can_pin_messages=False,
+            can_manage_topics=False,
+            can_post_stories=False,
+            can_edit_stories=False,
+            can_delete_stories=False,
+        )
+        await message.answer(f"✅ Removed administrator rights from <a href=\"tg://user?id={target.id}\">{html_lib.escape(target.full_name)}</a>.", parse_mode="HTML")
+    except Exception as exc:
+        detail = getattr(exc, "message", None) or str(exc)
+        await message.answer(
+            "❌ I couldn't demote that administrator. Make sure I'm an admin with the right to add administrators, "
+            "and that you have permission to manage this member.\n"
+            f"Details: {html_lib.escape(str(detail)[:400])}",
+            parse_mode="HTML",
+        )
+
+
 @dp.message(Command("kick"))
 async def kick_command(message: Message):
     if not await require_admin(message): return
@@ -867,7 +959,7 @@ async def founder_handler(message: Message):
     )
 
 
-@dp.message(F.text)
+@dp.message(F.text & ~F.text.startswith("/"))
 async def game_and_group_ai_handler(message: Message):
     text = (message.text or "").strip()
     if not text or text.startswith("/") or not message.from_user:
@@ -940,7 +1032,7 @@ async def list_pending_command(message: Message):
         return
     rows = await pending_rows(message.chat.id)
     if not rows:
-        await message.answer("📭 No tracked pending join requests for this group.")
+        await message.answer("📭 I have no tracked pending join requests for this group. I can list requests only after Telegram delivers them to me; requests from before tracking was enabled may not appear. Make sure I am an admin with the invite-users permission.")
         return
     lines = ["⏳ Pending join requests:"]
     for user_id, username, full_name, created_at in rows[:50]:
@@ -970,7 +1062,13 @@ async def process_pending_request(message: Message, approve: bool):
         await message.answer(f"✅ {verb} join request for <code>{user_id}</code>.", parse_mode="HTML")
     except Exception as exc:
         action = "approve" if approve else "decline"
-        await message.answer(f"Couldn't {action} that request. Ensure the bot is an admin with invite-user permissions and the request is still pending. ({type(exc).__name__})")
+        details = getattr(exc, "message", None) or str(exc)
+        await message.answer(
+            f"Couldn't {action} request for <code>{user_id}</code>. "
+            f"Check that the request is still pending and I have invite-users permission.\n"
+            f"Details: <code>{html_lib.escape(str(details)[:500])}</code>",
+            parse_mode="HTML",
+        )
 
 @dp.message(Command("approve"))
 async def approve_pending_command(message: Message):
@@ -983,7 +1081,7 @@ async def decline_pending_command(message: Message):
 @dp.message(Command("stats", "botstats"))
 async def owner_stats_command(message: Message):
     if not owner_only(message):
-        await message.answer("⛔ Owner-only command.")
+        await message.answer("⛔ Owner-only command. Set OWNER_ID in Render to your numeric Telegram user ID, then redeploy.")
         return
     with sqlite3.connect(DATABASE_PATH) as conn:
         dm_users = conn.execute("SELECT COUNT(DISTINCT user_id) FROM users WHERE private_chat_id IS NOT NULL").fetchone()[0]
@@ -999,7 +1097,7 @@ async def owner_stats_command(message: Message):
 @dp.message(Command("broadcast"))
 async def owner_broadcast_command(message: Message):
     if not owner_only(message):
-        await message.answer("⛔ Owner-only command.")
+        await message.answer("⛔ Owner-only command. Set OWNER_ID in Render to your numeric Telegram user ID, then redeploy.")
         return
     announcement = (message.text or "").partition(" ")[2].strip()
     if not announcement:
@@ -1013,8 +1111,9 @@ async def owner_broadcast_command(message: Message):
         try:
             await bot.send_message(target, "📢 <b>Announcement from Anonymous™ Mini</b>\n\n" + html_lib.escape(announcement), parse_mode="HTML")
             sent += 1
-        except Exception:
+        except Exception as exc:
             failed += 1
+            log.warning("Broadcast failed for chat_id=%s: %s", target, type(exc).__name__)
         await asyncio.sleep(0.04)
     await message.answer(f"📣 Broadcast finished.\n✅ Sent: {sent}\n⚠️ Failed/unreachable: {failed}")
 
@@ -1066,6 +1165,8 @@ async def main():
         BotCommand(command="list", description="List pending join requests: /list pending"),
         BotCommand(command="approve", description="Approve pending join request"),
         BotCommand(command="decline", description="Decline pending join request"),
+        BotCommand(command="promote", description="Promote a replied-to member to admin"),
+        BotCommand(command="demote", description="Remove admin rights from a replied-to admin"),
         BotCommand(command="stats", description="Owner bot statistics"),
         BotCommand(command="broadcast", description="Owner announcement broadcast"),
         BotCommand(command="ai", description="Ask AI"),
