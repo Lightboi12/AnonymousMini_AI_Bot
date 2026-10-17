@@ -12,7 +12,7 @@ from aiogram.enums import ChatType
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton as _InlineKeyboardButton,
-    ChatMember, BotCommand, ChatJoinRequest, TelegramObject, PollAnswer, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats
+    ChatMember, BotCommand, ChatJoinRequest, TelegramObject, PollAnswer, BotCommandScopeDefault, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats, BotCommandScopeChat
 )
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from typing import Callable, Awaitable, Any
@@ -1070,10 +1070,28 @@ async def main():
         BotCommand(command="broadcast", description="Owner announcement broadcast"),
         BotCommand(command="ai", description="Ask AI"),
     ]
-    # Telegram has separate command menus for groups and private chats.
-    await bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats())
-    group_commands = commands[:]
-    await bot.set_my_commands(group_commands, scope=BotCommandScopeAllGroupChats())
+    # Register a default menu too: some Telegram clients fall back to the default
+    # scope when a scoped menu is cached or not refreshed immediately.
+    public_commands = [c for c in commands if c.command not in {"stats", "broadcast"}]
+    group_commands = [
+        c for c in commands
+        if c.command not in {"stats", "broadcast"}
+    ]
+    try:
+        await bot.set_my_commands(public_commands, scope=BotCommandScopeDefault())
+        log.info("Registered default Telegram command menu (%s commands)", len(public_commands))
+        await bot.set_my_commands(public_commands, scope=BotCommandScopeAllPrivateChats())
+        log.info("Registered private-chat Telegram command menu")
+        await bot.set_my_commands(group_commands, scope=BotCommandScopeAllGroupChats())
+        log.info("Registered group Telegram command menu")
+        # Give the owner a more-specific private menu with owner-only commands.
+        if OWNER_ID:
+            await bot.set_my_commands(commands, scope=BotCommandScopeChat(chat_id=OWNER_ID))
+            log.info("Registered owner command menu for OWNER_ID=%s", OWNER_ID)
+        else:
+            log.warning("OWNER_ID is not set; /stats and /broadcast will reject everyone")
+    except Exception:
+        log.exception("Telegram command-menu registration failed")
     runner = await start_http_server()
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
