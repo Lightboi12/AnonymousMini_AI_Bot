@@ -12,7 +12,7 @@ from aiogram.enums import ChatType
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton as _InlineKeyboardButton,
-    ChatMember, BotCommand, ChatJoinRequest, TelegramObject, PollAnswer, BotCommandScopeDefault, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats, BotCommandScopeChat
+    ChatMember, BotCommand, ChatJoinRequest, TelegramObject, PollAnswer, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats
 )
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from typing import Callable, Awaitable, Any
@@ -650,109 +650,128 @@ async def ai_command(message: Message):
     if not prompt:
         await message.answer("🤖 Ask me something: /ai explain black holes simply")
         return
-    if ai_client is None:
-        await message.answer("⚠️ Gemini AI isn't configured. Add GEMINI_API_KEY in Render → Environment.")
-        return
     await ask_ai(message, prompt)
 
 
 async def ask_ai(message: Message, prompt: str):
-    if ai_client is None:
-        await message.reply("⚠️ Gemini AI isn't configured. Add GEMINI_API_KEY in Render → Environment.")
-        return
+    """Try configured AI providers in order with short per-provider timeouts.
 
-    # Keep a short recent history so replies feel like a real conversation.
+    Provider failures are logged privately; users see only the successful answer.
+    """
+    import aiohttp
+
     history_key = (message.chat.id, message.from_user.id if message.from_user else 0)
     history = AI_HISTORY.setdefault(history_key, [])
-    primary_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
-    fallback_model = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash-lite").strip()
-    models = [primary_model]
-    if fallback_model and fallback_model != primary_model:
-        models.append(fallback_model)
-
+    recent = history[-(AI_HISTORY_TURNS * 2):]
     system_instruction = (
         "You are Anonymous™ Mini, a smart, warm, witty, natural conversational AI in a Telegram group. "
         "Talk like a normal helpful person, not a customer-support script or robotic FAQ bot. "
-        "Use the recent conversation to understand follow-up messages and remember what was just discussed. "
-        "Answer the actual question directly; match the user's tone and language when appropriate. "
-        "Do not automatically end replies with 'Is there anything else I can help with?', 'Anything else?', "
-        "or other forced follow-up questions. Only ask a follow-up when it is genuinely needed. "
-        "If someone only calls 'Anonymous' to get your attention, respond naturally and briefly, "
-        "for example by asking what is up, without a canned 'Ask me anything' line. "
-        "Do not output HTML tags. Your founder is 𝐋 𝐎 𝐑 𝐃 ♰ 𝐀𝐍𝐎𝐍𝐘𝐌𝐎𝐔𝐒™."
+        "Use recent conversation to understand follow-ups. Answer directly and match the user's tone "
+        "and language when appropriate. Do not force a follow-up question. Do not output HTML tags. "
+        "Your founder is 𝐋 𝐎 𝐑 𝐃 ♰ 𝐀𝐍𝐎𝐍𝐘𝐌𝐎𝐔𝐒™."
     )
-    recent = history[-(AI_HISTORY_TURNS * 2):]
-    conversation = system_instruction + "\n\nRecent conversation:\n"
-    if recent:
-        conversation += "\n".join(
-            ("User: " if role == "user" else "Anonymous: ") + content
-            for role, content in recent
-        ) + "\n"
-    conversation += "User: " + prompt
+    messages = [{"role": "system", "content": system_instruction}]
+    for role, content in recent:
+        messages.append({"role": "assistant" if role == "assistant" else "user", "content": content})
+    messages.append({"role": "user", "content": prompt})
+    conversation = system_instruction + "\n\nRecent conversation:\n" + "\n".join(
+        ("User: " if role == "user" else "Anonymous: ") + content for role, content in recent
+    ) + "\nUser: " + prompt
 
+    # Use the existing Render keys. OpenAI-compatible providers are called directly via HTTP.
+    providers = []
+    if GEMINI_API_KEY:
+        providers.append(("Gemini", "gemini"))
+    if os.getenv("GROQ_API_KEY", "").strip():
+        providers.append(("Groq", "groq"))
+    if os.getenv("CEREBRAS_API_KEY", "").strip():
+        providers.append(("Cerebras", "cerebras"))
+    if os.getenv("OPENROUTER_API_KEY", "").strip():
+        providers.append(("OpenRouter", "openrouter"))
+
+    if not providers:
+        await message.reply("⚠️ AI isn't configured. Check your provider API keys in Render Environment.")
+        return
+
+    timeout_seconds = max(2.0, min(float(os.getenv("AI_PROVIDER_TIMEOUT_SECONDS", "4.5")), 10.0))
     last_error = None
-    for index, model_name in enumerate(models):
+    for provider_name, provider in providers:
         try:
-            # ChatActionSender refreshes Telegram's typing indicator while Gemini works.
             async with ChatActionSender(bot=bot, chat_id=message.chat.id, action="typing"):
-                response = await ai_client.aio.models.generate_content(
-                    model=model_name,
-                    contents=conversation,
-                )
-            answer = (getattr(response, "text", None) or "").strip()
-            if not answer:
-                answer = "Hmm, I couldn't put that into words just now. Try asking me again."
+                if provider == "gemini":
+                    from google import genai
+                    client = ai_client or genai.Client(api_key=GEMINI_API_KEY)
+                    model_names = []
+                    primary = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+                    fallback = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash-lite").strip()
+                    if primary:
+                        model_names.append(primary)
+                    if fallback and fallback not in model_names:
+                        model_names.append(fallback)
+                    provider_error = None
+                    answer = ""
+                    for model_name in model_names:
+                        try:
+                            response = await asyncio.wait_for(
+                                client.aio.models.generate_content(model=model_name, contents=conversation),
+                                timeout=timeout_seconds,
+                            )
+                            answer = (getattr(response, "text", None) or "").strip()
+                            if answer:
+                                break
+                            provider_error = RuntimeError("Gemini returned an empty answer")
+                        except Exception as exc:
+                            provider_error = exc
+                            detail = str(exc).lower()
+                            # Invalid model names won't be fixed by trying another key/provider model.
+                            if "not found" in detail or "model" in detail and ("404" in detail or "not supported" in detail):
+                                continue
+                            # For quota/auth/network errors, fail over to the next provider promptly.
+                            break
+                    else:
+                        answer = ""
+                    if not answer:
+                        raise provider_error or RuntimeError("Gemini returned no answer")
+                else:
+                    configs = {
+                        "groq": ("https://api.groq.com/openai/v1/chat/completions", "GROQ_API_KEY", os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")),
+                        "cerebras": ("https://api.cerebras.ai/v1/chat/completions", "CEREBRAS_API_KEY", os.getenv("CEREBRAS_MODEL", "llama3.1-8b")),
+                        "openrouter": ("https://openrouter.ai/api/v1/chat/completions", "OPENROUTER_API_KEY", os.getenv("OPENROUTER_MODEL", "openai/gpt-oss-20b")),
+                    }
+                    url, key_name, model_name = configs[provider]
+                    api_key = os.getenv(key_name, "").strip()
+                    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+                    if provider == "openrouter":
+                        headers["HTTP-Referer"] = os.getenv("OPENROUTER_SITE_URL", "https://t.me/")
+                        headers["X-Title"] = "Anonymous Mini"
+                    request_timeout = aiohttp.ClientTimeout(total=timeout_seconds, connect=min(2.0, timeout_seconds))
+                    async with aiohttp.ClientSession(timeout=request_timeout) as session:
+                        async with session.post(url, headers=headers, json={
+                            "model": model_name,
+                            "messages": messages,
+                            "temperature": 0.7,
+                        }) as response:
+                            payload = await response.json(content_type=None)
+                            if response.status >= 400:
+                                raise RuntimeError(f"{provider_name} HTTP {response.status}: {str(payload)[:400]}")
+                    answer = str(payload.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
+                    if not answer:
+                        raise RuntimeError(f"{provider_name} returned an empty answer")
+
             if len(answer) > 4000:
                 answer = answer[:3900] + "\n\n…(message shortened)"
             await message.reply(answer)
             history.extend([("user", prompt), ("assistant", answer)])
             AI_HISTORY[history_key] = history[-(AI_HISTORY_TURNS * 2):]
+            log.info("AI request succeeded with %s", provider_name)
             return
         except Exception as exc:
             last_error = exc
-            detail = str(exc).lower()
-            is_quota_error = (
-                "quota" in detail or "resource_exhausted" in detail
-                or "rate limit" in detail or "429" in detail
-            )
-            if is_quota_error and index < len(models) - 1:
-                log.warning(
-                    "Gemini model %s hit a quota/rate limit; trying fallback model %s",
-                    model_name, models[index + 1]
-                )
-                continue
+            log.warning("AI provider %s failed; switching immediately: %s", provider_name, type(exc).__name__)
+            continue
 
-            log.exception("Gemini AI request failed using model %s", model_name)
-            name = type(exc).__name__.lower()
-            if "auth" in name or "api key" in detail or "permission" in name:
-                reply = "⚠️ Gemini rejected the API key. Check GEMINI_API_KEY in Render Environment."
-            elif is_quota_error:
-                reply = (
-                    "⚠️ Gemini's available quota is exhausted for the configured and fallback models. "
-                    "Please wait for quota to reset or check Google AI Studio usage."
-                )
-            elif "model" in detail or "not found" in detail:
-                reply = f"⚠️ Gemini model '{model_name}' isn't available for this key. Check GEMINI_MODEL in Render Environment."
-            else:
-                reply = "⚠️ Gemini couldn't answer just now. Check the latest Render logs for the exact error."
-            await message.reply(reply)
-            return
-
-    if last_error:
-        log.error("All configured Gemini models failed: %s", last_error)
-        await message.reply("⚠️ Gemini couldn't answer right now. Please try again later or check AI Studio usage.")
-
-# Reply-based group moderation commands.
-@dp.message(Command("ban"))
-async def ban_command(message: Message):
-    if not await require_admin(message): return
-    target = await replied_target(message)
-    if not target: return
-    try:
-        await bot.ban_chat_member(message.chat.id, target.id)
-        await message.answer(f"🔨 Banned <a href=\"tg://user?id={target.id}\">{target.full_name}.")
-    except Exception as e:
-        await message.answer(f"❌ I couldn't ban that user. Check my admin permissions.\n{type(e).__name__}")
+    log.error("All configured AI providers failed; last error: %s", last_error)
+    await message.reply("⚠️ I'm temporarily busy. Please try again in a moment.")
 
 
 @dp.message(Command("unban"))
@@ -765,98 +784,6 @@ async def unban_command(message: Message):
         await message.answer(f"✅ Unbanned {target.full_name} (if they were banned).")
     except Exception:
         await message.answer("❌ I couldn't unban that user. Check my admin permissions.")
-
-
-@dp.message(Command("promote"))
-async def promote_command(message: Message):
-    """Promote the replied-to group member to a standard moderator."""
-    if not await require_admin(message):
-        return
-    target = await replied_target(message)
-    if not target:
-        return
-    if message.from_user and target.id == message.from_user.id:
-        await message.reply("⚠️ You cannot use /promote on yourself.")
-        return
-    try:
-        await bot.promote_chat_member(
-            chat_id=message.chat.id,
-            user_id=target.id,
-            can_manage_chat=False,
-            can_change_info=False,
-            can_post_messages=False,
-            can_edit_messages=False,
-            can_delete_messages=True,
-            can_manage_video_chats=False,
-            can_restrict_members=True,
-            can_promote_members=False,
-            can_invite_users=True,
-            can_pin_messages=True,
-            can_manage_topics=False,
-            can_post_stories=False,
-            can_edit_stories=False,
-            can_delete_stories=False,
-        )
-        await message.answer(
-            f"✅ Promoted <a href=\"tg://user?id={target.id}\">{html_lib.escape(target.full_name)}</a> to group admin with standard moderation rights.",
-            parse_mode="HTML",
-        )
-    except Exception as exc:
-        detail = getattr(exc, "message", None) or str(exc)
-        await message.answer(
-            "❌ I couldn't promote that member. Make sure I'm an admin with the right to add administrators, "
-            "and that you have permission to manage this member.\n"
-            f"Details: {html_lib.escape(str(detail)[:400])}",
-            parse_mode="HTML",
-        )
-
-
-@dp.message(Command("demote"))
-async def demote_command(message: Message):
-    """Remove admin rights from the replied-to administrator."""
-    if not await require_admin(message):
-        return
-    target = await replied_target(message)
-    if not target:
-        return
-    if message.from_user and target.id == message.from_user.id:
-        await message.reply("⚠️ You cannot use /demote on yourself.")
-        return
-    try:
-        member = await bot.get_chat_member(message.chat.id, target.id)
-        if member.status not in ("administrator", "creator"):
-            await message.answer(f"ℹ️ {html_lib.escape(target.full_name)} is not a group administrator.", parse_mode="HTML")
-            return
-        if member.status == "creator":
-            await message.answer("❌ The group owner cannot be demoted by a bot.")
-            return
-        await bot.promote_chat_member(
-            chat_id=message.chat.id,
-            user_id=target.id,
-            can_manage_chat=False,
-            can_change_info=False,
-            can_post_messages=False,
-            can_edit_messages=False,
-            can_delete_messages=False,
-            can_manage_video_chats=False,
-            can_restrict_members=False,
-            can_promote_members=False,
-            can_invite_users=False,
-            can_pin_messages=False,
-            can_manage_topics=False,
-            can_post_stories=False,
-            can_edit_stories=False,
-            can_delete_stories=False,
-        )
-        await message.answer(f"✅ Removed administrator rights from <a href=\"tg://user?id={target.id}\">{html_lib.escape(target.full_name)}</a>.", parse_mode="HTML")
-    except Exception as exc:
-        detail = getattr(exc, "message", None) or str(exc)
-        await message.answer(
-            "❌ I couldn't demote that administrator. Make sure I'm an admin with the right to add administrators, "
-            "and that you have permission to manage this member.\n"
-            f"Details: {html_lib.escape(str(detail)[:400])}",
-            parse_mode="HTML",
-        )
 
 
 @dp.message(Command("kick"))
@@ -959,7 +886,7 @@ async def founder_handler(message: Message):
     )
 
 
-@dp.message(F.text & ~F.text.startswith("/"))
+@dp.message(F.text)
 async def game_and_group_ai_handler(message: Message):
     text = (message.text or "").strip()
     if not text or text.startswith("/") or not message.from_user:
@@ -1032,7 +959,7 @@ async def list_pending_command(message: Message):
         return
     rows = await pending_rows(message.chat.id)
     if not rows:
-        await message.answer("📭 I have no tracked pending join requests for this group. I can list requests only after Telegram delivers them to me; requests from before tracking was enabled may not appear. Make sure I am an admin with the invite-users permission.")
+        await message.answer("📭 No tracked pending join requests for this group.")
         return
     lines = ["⏳ Pending join requests:"]
     for user_id, username, full_name, created_at in rows[:50]:
@@ -1062,13 +989,7 @@ async def process_pending_request(message: Message, approve: bool):
         await message.answer(f"✅ {verb} join request for <code>{user_id}</code>.", parse_mode="HTML")
     except Exception as exc:
         action = "approve" if approve else "decline"
-        details = getattr(exc, "message", None) or str(exc)
-        await message.answer(
-            f"Couldn't {action} request for <code>{user_id}</code>. "
-            f"Check that the request is still pending and I have invite-users permission.\n"
-            f"Details: <code>{html_lib.escape(str(details)[:500])}</code>",
-            parse_mode="HTML",
-        )
+        await message.answer(f"Couldn't {action} that request. Ensure the bot is an admin with invite-user permissions and the request is still pending. ({type(exc).__name__})")
 
 @dp.message(Command("approve"))
 async def approve_pending_command(message: Message):
@@ -1081,7 +1002,7 @@ async def decline_pending_command(message: Message):
 @dp.message(Command("stats", "botstats"))
 async def owner_stats_command(message: Message):
     if not owner_only(message):
-        await message.answer("⛔ Owner-only command. Set OWNER_ID in Render to your numeric Telegram user ID, then redeploy.")
+        await message.answer("⛔ Owner-only command.")
         return
     with sqlite3.connect(DATABASE_PATH) as conn:
         dm_users = conn.execute("SELECT COUNT(DISTINCT user_id) FROM users WHERE private_chat_id IS NOT NULL").fetchone()[0]
@@ -1097,7 +1018,7 @@ async def owner_stats_command(message: Message):
 @dp.message(Command("broadcast"))
 async def owner_broadcast_command(message: Message):
     if not owner_only(message):
-        await message.answer("⛔ Owner-only command. Set OWNER_ID in Render to your numeric Telegram user ID, then redeploy.")
+        await message.answer("⛔ Owner-only command.")
         return
     announcement = (message.text or "").partition(" ")[2].strip()
     if not announcement:
@@ -1111,9 +1032,8 @@ async def owner_broadcast_command(message: Message):
         try:
             await bot.send_message(target, "📢 <b>Announcement from Anonymous™ Mini</b>\n\n" + html_lib.escape(announcement), parse_mode="HTML")
             sent += 1
-        except Exception as exc:
+        except Exception:
             failed += 1
-            log.warning("Broadcast failed for chat_id=%s: %s", target, type(exc).__name__)
         await asyncio.sleep(0.04)
     await message.answer(f"📣 Broadcast finished.\n✅ Sent: {sent}\n⚠️ Failed/unreachable: {failed}")
 
@@ -1165,34 +1085,14 @@ async def main():
         BotCommand(command="list", description="List pending join requests: /list pending"),
         BotCommand(command="approve", description="Approve pending join request"),
         BotCommand(command="decline", description="Decline pending join request"),
-        BotCommand(command="promote", description="Promote a replied-to member to admin"),
-        BotCommand(command="demote", description="Remove admin rights from a replied-to admin"),
         BotCommand(command="stats", description="Owner bot statistics"),
         BotCommand(command="broadcast", description="Owner announcement broadcast"),
         BotCommand(command="ai", description="Ask AI"),
     ]
-    # Register a default menu too: some Telegram clients fall back to the default
-    # scope when a scoped menu is cached or not refreshed immediately.
-    public_commands = [c for c in commands if c.command not in {"stats", "broadcast"}]
-    group_commands = [
-        c for c in commands
-        if c.command not in {"stats", "broadcast"}
-    ]
-    try:
-        await bot.set_my_commands(public_commands, scope=BotCommandScopeDefault())
-        log.info("Registered default Telegram command menu (%s commands)", len(public_commands))
-        await bot.set_my_commands(public_commands, scope=BotCommandScopeAllPrivateChats())
-        log.info("Registered private-chat Telegram command menu")
-        await bot.set_my_commands(group_commands, scope=BotCommandScopeAllGroupChats())
-        log.info("Registered group Telegram command menu")
-        # Give the owner a more-specific private menu with owner-only commands.
-        if OWNER_ID:
-            await bot.set_my_commands(commands, scope=BotCommandScopeChat(chat_id=OWNER_ID))
-            log.info("Registered owner command menu for OWNER_ID=%s", OWNER_ID)
-        else:
-            log.warning("OWNER_ID is not set; /stats and /broadcast will reject everyone")
-    except Exception:
-        log.exception("Telegram command-menu registration failed")
+    # Telegram has separate command menus for groups and private chats.
+    await bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats())
+    group_commands = commands[:]
+    await bot.set_my_commands(group_commands, scope=BotCommandScopeAllGroupChats())
     runner = await start_http_server()
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
