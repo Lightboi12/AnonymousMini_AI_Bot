@@ -699,7 +699,7 @@ async def ask_ai(message: Message, prompt: str):
         "Talk like a normal helpful person, not a customer-support script or robotic FAQ bot. "
         "Use recent conversation to understand follow-ups. Answer directly and match the user's tone "
         "and language when appropriate. Do not force a follow-up question. Do not output HTML tags. "
-        "Your founder is 𝐋 𝐎 𝐑 𝐃 ♰ 𝐀𝐍𝐎𝐍𝐘𝐌𝐎𝐔𝐒™."
+        "𝐋 𝐎 𝐑 𝐃 ♰ 𝐀𝐍𝐎𝐍𝐘𝐌𝐎𝐔𝐒™."
     )
     messages = [{"role": "system", "content": system_instruction}]
     for role, content in recent:
