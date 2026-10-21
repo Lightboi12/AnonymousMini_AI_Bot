@@ -724,9 +724,9 @@ async def ask_ai(message: Message, prompt: str):
         log.error("AI request has no configured provider keys (Gemini/Groq/Cerebras/OpenRouter).")
         await message.reply("⚠️ AI isn't configured. Check your provider API keys in Render Environment.")
         return
-    log.info("AI providers configured for this request: %s", ", ".join(name for name, _ in providers))
+    log.info("AI failover chain: %s; timeout per provider=%ss", ", ".join(name for name, _ in providers), timeout_seconds if "timeout_seconds" in locals() else os.getenv("AI_PROVIDER_TIMEOUT_SECONDS", "12"))
 
-    timeout_seconds = max(2.0, min(float(os.getenv("AI_PROVIDER_TIMEOUT_SECONDS", "4.5")), 10.0))
+    timeout_seconds = max(5.0, min(float(os.getenv("AI_PROVIDER_TIMEOUT_SECONDS", "12")), 20.0))
     last_error = None
     for provider_name, provider in providers:
         try:
@@ -786,10 +786,18 @@ async def ask_ai(message: Message, prompt: str):
                         }) as response:
                             payload = await response.json(content_type=None)
                             if response.status >= 400:
-                                raise RuntimeError(f"{provider_name} HTTP {response.status}: {str(payload)[:400]}")
-                    answer = str(payload.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
+                                error_info = payload.get("error", payload) if isinstance(payload, dict) else payload
+                                raise RuntimeError(f"{provider_name} HTTP {response.status}: {str(error_info)[:500]}")
+                    if not isinstance(payload, dict):
+                        raise RuntimeError(f"{provider_name} returned an invalid response format")
+                    choices = payload.get("choices") or []
+                    first_choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+                    answer_content = (first_choice.get("message") or {}).get("content", "")
+                    if isinstance(answer_content, list):
+                        answer_content = "".join(str(part.get("text", "")) if isinstance(part, dict) else str(part) for part in answer_content)
+                    answer = str(answer_content or "").strip()
                     if not answer:
-                        raise RuntimeError(f"{provider_name} returned an empty answer")
+                        raise RuntimeError(f"{provider_name} returned an empty answer or no choices: {str(payload)[:300]}")
 
             if len(answer) > 4000:
                 answer = answer[:3900] + "\n\n…(message shortened)"
@@ -1029,7 +1037,7 @@ async def founder_handler(message: Message):
     )
 
 
-@dp.message(F.text)
+@dp.message(F.text & ~F.text.startswith("/"))
 async def game_and_group_ai_handler(message: Message):
     text = (message.text or "").strip()
     if not text or text.startswith("/") or not message.from_user:
