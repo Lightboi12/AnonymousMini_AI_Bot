@@ -34,6 +34,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 PORT = int(os.getenv("PORT", "10000"))
 OWNER_ID = int(os.getenv("OWNER_ID", "0") or "0")
 DATABASE_PATH = os.getenv("DATABASE_PATH", "anonymous_mini.sqlite3")
+EWE_SOUND_FILE_ID = os.getenv("EWE_SOUND_FILE_ID", "").strip()  # Optional Telegram file_id for the sound effect
 
 
 # Telegram Bot API 9.4 button styles: blue primary, green success, red danger.
@@ -142,7 +143,8 @@ HELP_TEXT = (
     "• Use the buttons below to explore.\n"
     "• In groups, reply to a message when using moderation commands.\n"
     "• Group moderation commands generally require admin permissions.\n"
-    "• For /promote and /demote, reply to the target member’s message.\n"
+    "• For /promote, /demote, and /purge, follow the command usage shown in /commands.\n"
+    "• The playful Auto-Lie Detector is a joke feature, not a real fact-checker.\n"
     "• The bot must be an admin with permission to add new administrators.\n"
     "• AI uses your configured Gemini, Groq, Cerebras, and OpenRouter providers."
 )
@@ -156,7 +158,8 @@ COMMANDS_TEXT = (
     "/about — About this bot\n"
     "/ping — Check bot response\n"
     "/promote — Promote the replied-to member (group admin)\n"
-    "/demote — Remove admin rights from the replied-to admin (group admin)\n\n"
+    "/demote — Remove admin rights from the replied-to admin (group admin)\n"
+    "/purge [count] — Delete recent messages (reply to a message first)\n\n"
     "😂 Fun\n"
     "/joke — Random joke\n"
     "/fact — Random fact\n"
@@ -169,6 +172,7 @@ COMMANDS_TEXT = (
     "/dare — Random dare\n"
     "/riddle — Get a riddle\n"
     "/quiz — Set up a timed category quiz\n"
+    "/flirt — Send a playful flirt line (reply to someone to tag them)\n"
     "/ship @user @user — Fun compatibility score\n\n"
     "🤖 AI\n"
     "/ai your question — Ask AI (requires API key)\n"
@@ -590,10 +594,24 @@ async def send_quiz_question(chat_id: int, message_id: int = 0):
         return
     idx = quiz_state["index"]
     if idx >= len(quiz_state["questions"]):
-        score_lines = sorted(quiz_state["scores"].items(), key=lambda item: (-item[1], item[0].casefold()))
-        leaderboard = "\n".join(f"{i+1}. {name}: {score}/{len(quiz_state['questions'])}" for i, (name, score) in enumerate(score_lines[:10])) or "No answers recorded."
+        # Scores are keyed by Telegram user ID so users with the same display name stay separate.
+        score_lines = sorted(
+            quiz_state["scores"].items(),
+            key=lambda item: (-item[1].get("score", 0), item[1].get("name", "").casefold()),
+        )
+        leaderboard_lines = []
+        for rank, (user_id, player) in enumerate(score_lines[:10], start=1):
+            display_name = html_lib.escape(player.get("name", "Player"))
+            # tg://user?id=... creates a genuine Telegram mention even when the player has no username.
+            tag = f'<a href="tg://user?id={int(user_id)}">{display_name}</a>'
+            leaderboard_lines.append(f"{rank}. {tag}: {player.get('score', 0)}/{len(quiz_state['questions'])}")
+        leaderboard = "\n".join(leaderboard_lines) or "No answers recorded."
         try:
-            await bot.send_message(chat_id, f"🏁 <b>QUIZ FINISHED!</b>\n{html_lib.escape(quiz_state['category'])} · {len(quiz_state['questions'])} rounds\n\n🏆 <b>Scores</b>\n{html_lib.escape(leaderboard)}", parse_mode="HTML")
+            await bot.send_message(
+                chat_id,
+                f"🏁 <b>QUIZ FINISHED!</b>\n{html_lib.escape(quiz_state['category'])} · {len(quiz_state['questions'])} rounds\n\n🏆 <b>Scores</b>\n{leaderboard}",
+                parse_mode="HTML",
+            )
         except Exception:
             log.exception("Could not send quiz results")
         ACTIVE_QUIZZES.pop(chat_id, None)
@@ -635,6 +653,7 @@ async def quiz_poll_answer(answer: PollAnswer):
     _, _, _, options, correct = state["questions"][idx]
     state["answers"][answer.user.id] = {
         "name": answer.user.full_name,
+        "username": answer.user.username,
         "chosen": answer.option_ids[0],
     }
 
@@ -649,9 +668,11 @@ async def quiz_question_timer(chat_id: int, message_id: int, idx: int):
         if not state or state["index"] != idx:
             return
         _, _, _, options, correct = state["questions"][idx]
-        for answer in state["answers"].values():
-            name = answer["name"]
-            state["scores"][name] = state["scores"].get(name, 0) + (1 if answer["chosen"] == correct else 0)
+        for user_id, answer in state["answers"].items():
+            player = state["scores"].setdefault(user_id, {"name": answer["name"], "username": answer.get("username"), "score": 0})
+            player["name"] = answer["name"]
+            player["username"] = answer.get("username")
+            player["score"] += 1 if answer["chosen"] == correct else 0
         if not state["answers"]:
             await bot.send_message(chat_id, f"⏰ Round {idx+1} ended — nobody answered.\n✅ Correct answer: {options[correct]}")
         POLL_TO_QUIZ.pop(state.get("poll_id"), None)
@@ -661,6 +682,30 @@ async def quiz_question_timer(chat_id: int, message_id: int, idx: int):
         return
     except Exception:
         log.exception("Quiz poll timer failed")
+
+
+FLIRT_LINES = [
+    "If fine were a crime, you for don collect life sentence 😌❤️",
+    "I no be photographer, but I fit picture us together 😂📸",
+    "Your smile get better network than 5G—e dey connect straight to my heart 📶💘",
+    "I wan report something: you don steal my attention without permission 😭❤️",
+    "You be sunshine? Because everywhere just bright when you show up ☀️🥰",
+    "I no get plenty lines, but I get genuine vibes and small-small butterflies 🦋😅",
+    "Abeg, who give you permission to look this adorable? 😭💗",
+    "If chatting with you na assignment, I go submit before deadline 😌📚❤️",
+]
+
+
+@dp.message(Command("flirt"))
+async def flirt_command(message: Message):
+    """Send a light, respectful flirt line; replying to someone tags that Telegram user."""
+    target = message.reply_to_message.from_user if message.reply_to_message else None
+    line = random.choice(FLIRT_LINES)
+    if target and not target.is_bot:
+        tag = f'<a href="tg://user?id={target.id}">{html_lib.escape(target.full_name)}</a>'
+        await message.answer(f"💘 {tag}, {html_lib.escape(line)}", parse_mode="HTML")
+    else:
+        await message.answer(f"💘 {html_lib.escape(line)}", parse_mode="HTML")
 
 
 @dp.message(Command("ship"))
@@ -698,7 +743,9 @@ async def ask_ai(message: Message, prompt: str):
         "You are Anonymous™ Mini, a smart, warm, witty, natural conversational AI in a Telegram group. "
         "Talk like a normal helpful person, not a customer-support script or robotic FAQ bot. "
         "Use recent conversation to understand follow-ups. Answer directly and match the user's tone "
-        "and language when appropriate. Do not force a follow-up question. Do not output HTML tags. "
+        "and language when appropriate. If asked to flirt or write a pickup line, be playful, charming, respectful, "
+        "and non-pushy; never assume someone's gender or imply they owe romantic attention. "
+        "Do not force a follow-up question. Do not output HTML tags. "
         "𝐋 𝐎 𝐑 𝐃 ♰ 𝐀𝐍𝐎𝐍𝐘𝐌𝐎𝐔𝐒™."
     )
     messages = [{"role": "system", "content": system_instruction}]
@@ -937,6 +984,49 @@ async def demote_command(message: Message):
 
 
 
+@dp.message(Command("purge"))
+async def purge_command(message: Message):
+    """Delete a replied-to message and up to N preceding messages in a group."""
+    if not await require_admin(message):
+        return
+    if not message.reply_to_message:
+        await message.reply("🧹 Reply to the last message you want removed, then use /purge or /purge 20. I can delete up to 100 messages at a time.")
+        return
+    try:
+        parts = (message.text or "").split()
+        count = int(parts[1]) if len(parts) > 1 else 1
+        if count < 1 or count > 100:
+            await message.reply("⚠️ Choose a count from 1 to 100.")
+            return
+    except ValueError:
+        await message.reply("Usage: reply to a message with /purge [count]")
+        return
+    if not getattr(message.chat, "permissions", None) and message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+    start_id = message.reply_to_message.message_id
+    deleted = 0
+    # Telegram has no history-list API, so delete consecutive IDs backwards from the replied-to message.
+    for message_id in range(start_id, max(0, start_id-count), -1):
+        try:
+            await bot.delete_message(message.chat.id, message_id)
+            deleted += 1
+        except TelegramBadRequest:
+            continue
+        except TelegramForbiddenError:
+            await message.answer("❌ I need permission to delete messages in this group.")
+            return
+        except Exception as exc:
+            log.warning("Purge delete failed: %s", type(exc).__name__)
+    try:
+        await bot.delete_message(message.chat.id, message.message_id)
+    except Exception:
+        pass
+    try:
+        await bot.send_message(message.chat.id, f"🧹 Purge complete: deleted {deleted} message(s).")
+    except Exception:
+        pass
+
+
 @dp.message(Command("kick"))
 async def kick_command(message: Message):
     if not await require_admin(message): return
@@ -1035,6 +1125,48 @@ async def founder_handler(message: Message):
         parse_mode="HTML",
         disable_web_page_preview=True,
     )
+
+
+@dp.message(F.voice)
+async def long_voice_note_handler(message: Message):
+    voice = message.voice
+    if voice and voice.duration >= 600:
+        await message.reply("🗣️😂 Summary abeg! This voice note na full episode. Give us the short version.")
+
+
+# Playful phrase-trigger detector: it cannot determine whether a claim is actually false.
+CAP_PHRASES = (
+    "trust me bro", "source: trust me", "my uncle works at", "i swear on", "100% real",
+    "everybody knows", "they don't want you to know", "no evidence but", "i heard from a guy",
+)
+
+@dp.message(
+    F.text & ~F.text.startswith("/") & (
+        F.text.lower().contains("trust me bro")
+        | F.text.lower().contains("source: trust me")
+        | F.text.lower().contains("my uncle works at")
+        | F.text.lower().contains("i swear on")
+        | F.text.lower().contains("100% real")
+        | F.text.lower().contains("everybody knows")
+        | F.text.lower().contains("they don't want you to know")
+        | F.text.lower().contains("no evidence but")
+        | F.text.lower().contains("i heard from a guy")
+    )
+)
+async def playful_lie_detector(message: Message):
+    if message.chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
+        return
+    text = (message.text or "").lower()
+    if not text or not any(phrase in text for phrase in CAP_PHRASES):
+        return
+    try:
+        if EWE_SOUND_FILE_ID:
+            await message.reply_audio(EWE_SOUND_FILE_ID, caption="🎬 Eweee! Anonymous™ cap detector don hear something suspicious 😂 (Just for jokes—verify claims yourself.)")
+        else:
+            await message.reply("🎬🔊 *Eweee!* 😂 Anonymous™ cap detector don hear something suspicious! Abeg bring source. (Na joke, no be real fact-check.)", parse_mode="Markdown")
+    except Exception as exc:
+        log.warning("Eweee sound send failed: %s", type(exc).__name__)
+        await message.reply("🎬🔊 Eweee! 😂 Abeg bring source—this detector na cruise, no be real fact-check.")
 
 
 @dp.message(F.text & ~F.text.startswith("/"))
@@ -1266,6 +1398,7 @@ async def main():
         BotCommand(command="ping", description="Check bot status"),
         BotCommand(command="promote", description="Promote replied-to group member"),
         BotCommand(command="demote", description="Demote replied-to group admin"),
+        BotCommand(command="purge", description="Delete recent group messages"),
         BotCommand(command="joke", description="Get a random joke"),
         BotCommand(command="fact", description="Get a random fact"),
         BotCommand(command="quote", description="Get a motivational quote"),
@@ -1277,6 +1410,7 @@ async def main():
         BotCommand(command="dare", description="Get a dare"),
         BotCommand(command="riddle", description="Get a riddle"),
         BotCommand(command="quiz", description="Set up a timed category quiz"),
+        BotCommand(command="flirt", description="Send a playful flirt line"),
         BotCommand(command="list", description="List pending join requests: /list pending"),
         BotCommand(command="approve", description="Approve pending join request"),
         BotCommand(command="decline", description="Decline pending join request"),
