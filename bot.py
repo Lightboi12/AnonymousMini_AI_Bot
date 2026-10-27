@@ -30,6 +30,8 @@ logging.basicConfig(
 log = logging.getLogger("anonymous-mini")
 
 TOKEN = os.getenv("TOKEN", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-6-astra").strip() or "gpt-6-astra"
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 PORT = int(os.getenv("PORT", "10000"))
 OWNER_ID = int(os.getenv("OWNER_ID", "0") or "0")
@@ -756,19 +758,21 @@ async def ask_ai(message: Message, prompt: str):
         ("User: " if role == "user" else "Anonymous: ") + content for role, content in recent
     ) + "\nUser: " + prompt
 
-    # Use the existing Render keys. OpenAI-compatible providers are called directly via HTTP.
+    # Provider order: GPT-6 Astra first, then the existing automatic fallbacks.
     providers = []
-    if GEMINI_API_KEY:
-        providers.append(("Gemini", "gemini"))
+    if OPENAI_API_KEY:
+        providers.append(("GPT-6 Astra", "openai"))
     if os.getenv("GROQ_API_KEY", "").strip():
         providers.append(("Groq", "groq"))
     if os.getenv("CEREBRAS_API_KEY", "").strip():
         providers.append(("Cerebras", "cerebras"))
+    if GEMINI_API_KEY:
+        providers.append(("Gemini", "gemini"))
     if os.getenv("OPENROUTER_API_KEY", "").strip():
         providers.append(("OpenRouter", "openrouter"))
 
     if not providers:
-        log.error("AI request has no configured provider keys (Gemini/Groq/Cerebras/OpenRouter).")
+        log.error("AI request has no configured provider keys (OpenAI/Groq/Cerebras/Gemini/OpenRouter).")
         await message.reply("⚠️ AI isn't configured. Check your provider API keys in Render Environment.")
         return
     log.info("AI failover chain: %s; timeout per provider=%ss", ", ".join(name for name, _ in providers), timeout_seconds if "timeout_seconds" in locals() else os.getenv("AI_PROVIDER_TIMEOUT_SECONDS", "12"))
@@ -814,6 +818,7 @@ async def ask_ai(message: Message, prompt: str):
                         raise provider_error or RuntimeError("Gemini returned no answer")
                 else:
                     configs = {
+                        "openai": ("https://api.openai.com/v1/chat/completions", "OPENAI_API_KEY", OPENAI_MODEL),
                         "groq": ("https://api.groq.com/openai/v1/chat/completions", "GROQ_API_KEY", os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")),
                         "cerebras": ("https://api.cerebras.ai/v1/chat/completions", "CEREBRAS_API_KEY", os.getenv("CEREBRAS_MODEL", "llama3.1-8b")),
                         "openrouter": ("https://openrouter.ai/api/v1/chat/completions", "OPENROUTER_API_KEY", os.getenv("OPENROUTER_MODEL", "openai/gpt-oss-20b")),
@@ -826,11 +831,13 @@ async def ask_ai(message: Message, prompt: str):
                         headers["X-Title"] = "Anonymous Mini"
                     request_timeout = aiohttp.ClientTimeout(total=timeout_seconds, connect=min(2.0, timeout_seconds))
                     async with aiohttp.ClientSession(timeout=request_timeout) as session:
-                        async with session.post(url, headers=headers, json={
-                            "model": model_name,
-                            "messages": messages,
-                            "temperature": 0.7,
-                        }) as response:
+                        request_payload = {"model": model_name, "messages": messages}
+                        if provider == "openai":
+                            # GPT-6 Astra supports reasoning_effort; omit temperature for reasoning models.
+                            request_payload["reasoning_effort"] = os.getenv("OPENAI_REASONING_EFFORT", "low").strip() or "low"
+                        else:
+                            request_payload["temperature"] = 0.7
+                        async with session.post(url, headers=headers, json=request_payload) as response:
                             payload = await response.json(content_type=None)
                             if response.status >= 400:
                                 error_info = payload.get("error", payload) if isinstance(payload, dict) else payload
@@ -857,7 +864,7 @@ async def ask_ai(message: Message, prompt: str):
             last_error = exc
             # Include the provider's actual rejection reason in Render logs, but never API keys.
             detail = (str(exc).replace("\n", " ").strip() or repr(exc))[:700]
-            for secret_name in ("GEMINI_API_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY", "OPENROUTER_API_KEY"):
+            for secret_name in ("OPENAI_API_KEY", "GEMINI_API_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY", "OPENROUTER_API_KEY"):
                 secret_value = os.getenv(secret_name, "").strip()
                 if secret_value:
                     detail = detail.replace(secret_value, "[REDACTED]")
@@ -866,7 +873,7 @@ async def ask_ai(message: Message, prompt: str):
             continue
 
     final_detail = (str(last_error).replace("\n", " ").strip() or repr(last_error))[:700] if last_error else "none"
-    for secret_name in ("GEMINI_API_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY", "OPENROUTER_API_KEY"):
+    for secret_name in ("OPENAI_API_KEY", "GEMINI_API_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY", "OPENROUTER_API_KEY"):
         secret_value = os.getenv(secret_name, "").strip()
         if secret_value:
             final_detail = final_detail.replace(secret_value, "[REDACTED]")
