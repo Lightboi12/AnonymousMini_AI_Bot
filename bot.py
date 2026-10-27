@@ -12,7 +12,7 @@ from aiogram.enums import ChatType
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton as _InlineKeyboardButton,
-    ChatMember, BotCommand, ChatJoinRequest, TelegramObject, PollAnswer, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats, BotCommandScopeChat
+    ChatMember, BotCommand, ChatJoinRequest, TelegramObject, PollAnswer, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats
 )
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from typing import Callable, Awaitable, Any
@@ -30,13 +30,10 @@ logging.basicConfig(
 log = logging.getLogger("anonymous-mini")
 
 TOKEN = os.getenv("TOKEN", "").strip()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-6-astra").strip() or "gpt-6-astra"
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 PORT = int(os.getenv("PORT", "10000"))
 OWNER_ID = int(os.getenv("OWNER_ID", "0") or "0")
 DATABASE_PATH = os.getenv("DATABASE_PATH", "anonymous_mini.sqlite3")
-EWE_SOUND_FILE_ID = os.getenv("EWE_SOUND_FILE_ID", "").strip()  # Optional Telegram file_id for the sound effect
 
 
 # Telegram Bot API 9.4 button styles: blue primary, green success, red danger.
@@ -145,10 +142,7 @@ HELP_TEXT = (
     "• Use the buttons below to explore.\n"
     "• In groups, reply to a message when using moderation commands.\n"
     "• Group moderation commands generally require admin permissions.\n"
-    "• For /promote, /demote, and /purge, follow the command usage shown in /commands.\n"
-    "• The playful Auto-Lie Detector is a joke feature, not a real fact-checker.\n"
-    "• The bot must be an admin with permission to add new administrators.\n"
-    "• AI uses your configured Gemini, Groq, Cerebras, and OpenRouter providers."
+    "• AI requires the OPENAI_API_KEY environment variable."
 )
 
 COMMANDS_TEXT = (
@@ -158,10 +152,7 @@ COMMANDS_TEXT = (
     "/help — Help and usage\n"
     "/commands — Show commands\n"
     "/about — About this bot\n"
-    "/ping — Check bot response\n"
-    "/promote — Promote the replied-to member (group admin)\n"
-    "/demote — Remove admin rights from the replied-to admin (group admin)\n"
-    "/purge [count] — Delete recent messages (reply to a message first)\n\n"
+    "/ping — Check bot response\n\n"
     "😂 Fun\n"
     "/joke — Random joke\n"
     "/fact — Random fact\n"
@@ -174,7 +165,6 @@ COMMANDS_TEXT = (
     "/dare — Random dare\n"
     "/riddle — Get a riddle\n"
     "/quiz — Set up a timed category quiz\n"
-    "/flirt — Send a playful flirt line (reply to someone to tag them)\n"
     "/ship @user @user — Fun compatibility score\n\n"
     "🤖 AI\n"
     "/ai your question — Ask AI (requires API key)\n"
@@ -340,33 +330,6 @@ async def replied_target(message: Message):
         await message.reply("🤖 I can't apply that action to a bot.")
         return None
     return target
-
-
-async def bot_can_promote_members(message: Message) -> bool:
-    """Check the bot's Telegram admin rights before promote/demote API calls."""
-    try:
-        me = await bot.get_me()
-        member = await bot.get_chat_member(message.chat.id, me.id)
-        if member.status not in ("administrator", "creator"):
-            await message.reply(
-                "❌ I am not a group administrator. Promote me to admin first, then enable "
-                "the permission to add new administrators (Manage/Promote admins)."
-            )
-            return False
-        if member.status != "creator" and not getattr(member, "can_promote_members", False):
-            await message.reply(
-                "❌ I am a group admin, but I do not have permission to add new administrators. "
-                "Open Group Settings → Administrators → Anonymous™ Mini and enable the “Add New Admins” / “Promote Members” permission. Then try again."
-            )
-            return False
-        return True
-    except Exception as exc:
-        log.warning("Could not verify bot admin rights: %s", type(exc).__name__)
-        await message.reply(
-            "❌ I couldn't verify my group permissions. Make sure I'm an administrator "
-            "with permission to add new administrators, then try again."
-        )
-        return False
 
 
 async def require_admin(message: Message) -> bool:
@@ -596,24 +559,10 @@ async def send_quiz_question(chat_id: int, message_id: int = 0):
         return
     idx = quiz_state["index"]
     if idx >= len(quiz_state["questions"]):
-        # Scores are keyed by Telegram user ID so users with the same display name stay separate.
-        score_lines = sorted(
-            quiz_state["scores"].items(),
-            key=lambda item: (-item[1].get("score", 0), item[1].get("name", "").casefold()),
-        )
-        leaderboard_lines = []
-        for rank, (user_id, player) in enumerate(score_lines[:10], start=1):
-            display_name = html_lib.escape(player.get("name", "Player"))
-            # tg://user?id=... creates a genuine Telegram mention even when the player has no username.
-            tag = f'<a href="tg://user?id={int(user_id)}">{display_name}</a>'
-            leaderboard_lines.append(f"{rank}. {tag}: {player.get('score', 0)}/{len(quiz_state['questions'])}")
-        leaderboard = "\n".join(leaderboard_lines) or "No answers recorded."
+        score_lines = sorted(quiz_state["scores"].items(), key=lambda item: (-item[1], item[0].casefold()))
+        leaderboard = "\n".join(f"{i+1}. {name}: {score}/{len(quiz_state['questions'])}" for i, (name, score) in enumerate(score_lines[:10])) or "No answers recorded."
         try:
-            await bot.send_message(
-                chat_id,
-                f"🏁 <b>QUIZ FINISHED!</b>\n{html_lib.escape(quiz_state['category'])} · {len(quiz_state['questions'])} rounds\n\n🏆 <b>Scores</b>\n{leaderboard}",
-                parse_mode="HTML",
-            )
+            await bot.send_message(chat_id, f"🏁 <b>QUIZ FINISHED!</b>\n{html_lib.escape(quiz_state['category'])} · {len(quiz_state['questions'])} rounds\n\n🏆 <b>Scores</b>\n{html_lib.escape(leaderboard)}", parse_mode="HTML")
         except Exception:
             log.exception("Could not send quiz results")
         ACTIVE_QUIZZES.pop(chat_id, None)
@@ -655,7 +604,6 @@ async def quiz_poll_answer(answer: PollAnswer):
     _, _, _, options, correct = state["questions"][idx]
     state["answers"][answer.user.id] = {
         "name": answer.user.full_name,
-        "username": answer.user.username,
         "chosen": answer.option_ids[0],
     }
 
@@ -670,11 +618,9 @@ async def quiz_question_timer(chat_id: int, message_id: int, idx: int):
         if not state or state["index"] != idx:
             return
         _, _, _, options, correct = state["questions"][idx]
-        for user_id, answer in state["answers"].items():
-            player = state["scores"].setdefault(user_id, {"name": answer["name"], "username": answer.get("username"), "score": 0})
-            player["name"] = answer["name"]
-            player["username"] = answer.get("username")
-            player["score"] += 1 if answer["chosen"] == correct else 0
+        for answer in state["answers"].values():
+            name = answer["name"]
+            state["scores"][name] = state["scores"].get(name, 0) + (1 if answer["chosen"] == correct else 0)
         if not state["answers"]:
             await bot.send_message(chat_id, f"⏰ Round {idx+1} ended — nobody answered.\n✅ Correct answer: {options[correct]}")
         POLL_TO_QUIZ.pop(state.get("poll_id"), None)
@@ -684,30 +630,6 @@ async def quiz_question_timer(chat_id: int, message_id: int, idx: int):
         return
     except Exception:
         log.exception("Quiz poll timer failed")
-
-
-FLIRT_LINES = [
-    "If fine were a crime, you for don collect life sentence 😌❤️",
-    "I no be photographer, but I fit picture us together 😂📸",
-    "Your smile get better network than 5G—e dey connect straight to my heart 📶💘",
-    "I wan report something: you don steal my attention without permission 😭❤️",
-    "You be sunshine? Because everywhere just bright when you show up ☀️🥰",
-    "I no get plenty lines, but I get genuine vibes and small-small butterflies 🦋😅",
-    "Abeg, who give you permission to look this adorable? 😭💗",
-    "If chatting with you na assignment, I go submit before deadline 😌📚❤️",
-]
-
-
-@dp.message(Command("flirt"))
-async def flirt_command(message: Message):
-    """Send a light, respectful flirt line; replying to someone tags that Telegram user."""
-    target = message.reply_to_message.from_user if message.reply_to_message else None
-    line = random.choice(FLIRT_LINES)
-    if target and not target.is_bot:
-        tag = f'<a href="tg://user?id={target.id}">{html_lib.escape(target.full_name)}</a>'
-        await message.answer(f"💘 {tag}, {html_lib.escape(line)}", parse_mode="HTML")
-    else:
-        await message.answer(f"💘 {html_lib.escape(line)}", parse_mode="HTML")
 
 
 @dp.message(Command("ship"))
@@ -728,158 +650,109 @@ async def ai_command(message: Message):
     if not prompt:
         await message.answer("🤖 Ask me something: /ai explain black holes simply")
         return
+    if ai_client is None:
+        await message.answer("⚠️ Gemini AI isn't configured. Add GEMINI_API_KEY in Render → Environment.")
+        return
     await ask_ai(message, prompt)
 
 
 async def ask_ai(message: Message, prompt: str):
-    """Try configured AI providers in order with short per-provider timeouts.
+    if ai_client is None:
+        await message.reply("⚠️ Gemini AI isn't configured. Add GEMINI_API_KEY in Render → Environment.")
+        return
 
-    Provider failures are logged privately; users see only the successful answer.
-    """
-    import aiohttp
-
+    # Keep a short recent history so replies feel like a real conversation.
     history_key = (message.chat.id, message.from_user.id if message.from_user else 0)
     history = AI_HISTORY.setdefault(history_key, [])
-    recent = history[-(AI_HISTORY_TURNS * 2):]
+    primary_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+    fallback_model = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash-lite").strip()
+    models = [primary_model]
+    if fallback_model and fallback_model != primary_model:
+        models.append(fallback_model)
+
     system_instruction = (
         "You are Anonymous™ Mini, a smart, warm, witty, natural conversational AI in a Telegram group. "
         "Talk like a normal helpful person, not a customer-support script or robotic FAQ bot. "
-        "Use recent conversation to understand follow-ups. Answer directly and match the user's tone "
-        "and language when appropriate. If asked to flirt or write a pickup line, be playful, charming, respectful, "
-        "and non-pushy; never assume someone's gender or imply they owe romantic attention. "
-        "Do not force a follow-up question. Do not output HTML tags. "
-        "𝐋 𝐎 𝐑 𝐃 ♰ 𝐀𝐍𝐎𝐍𝐘𝐌𝐎𝐔𝐒™."
+        "Use the recent conversation to understand follow-up messages and remember what was just discussed. "
+        "Answer the actual question directly; match the user's tone and language when appropriate. "
+        "Do not automatically end replies with 'Is there anything else I can help with?', 'Anything else?', "
+        "or other forced follow-up questions. Only ask a follow-up when it is genuinely needed. "
+        "If someone only calls 'Anonymous' to get your attention, respond naturally and briefly, "
+        "for example by asking what is up, without a canned 'Ask me anything' line. "
+        "Do not output HTML tags. Your founder is 𝐋 𝐎 𝐑 𝐃 ♰ 𝐀𝐍𝐎𝐍𝐘𝐌𝐎𝐔𝐒™."
     )
-    messages = [{"role": "system", "content": system_instruction}]
-    for role, content in recent:
-        messages.append({"role": "assistant" if role == "assistant" else "user", "content": content})
-    messages.append({"role": "user", "content": prompt})
-    conversation = system_instruction + "\n\nRecent conversation:\n" + "\n".join(
-        ("User: " if role == "user" else "Anonymous: ") + content for role, content in recent
-    ) + "\nUser: " + prompt
+    recent = history[-(AI_HISTORY_TURNS * 2):]
+    conversation = system_instruction + "\n\nRecent conversation:\n"
+    if recent:
+        conversation += "\n".join(
+            ("User: " if role == "user" else "Anonymous: ") + content
+            for role, content in recent
+        ) + "\n"
+    conversation += "User: " + prompt
 
-    # Provider order: GPT-6 Astra first, then the existing automatic fallbacks.
-    providers = []
-    if OPENAI_API_KEY:
-        providers.append(("GPT-6 Astra", "openai"))
-    if os.getenv("GROQ_API_KEY", "").strip():
-        providers.append(("Groq", "groq"))
-    if os.getenv("CEREBRAS_API_KEY", "").strip():
-        providers.append(("Cerebras", "cerebras"))
-    if GEMINI_API_KEY:
-        providers.append(("Gemini", "gemini"))
-    if os.getenv("OPENROUTER_API_KEY", "").strip():
-        providers.append(("OpenRouter", "openrouter"))
-
-    if not providers:
-        log.error("AI request has no configured provider keys (OpenAI/Groq/Cerebras/Gemini/OpenRouter).")
-        await message.reply("⚠️ AI isn't configured. Check your provider API keys in Render Environment.")
-        return
-    log.info("AI failover chain: %s; timeout per provider=%ss", ", ".join(name for name, _ in providers), timeout_seconds if "timeout_seconds" in locals() else os.getenv("AI_PROVIDER_TIMEOUT_SECONDS", "12"))
-
-    timeout_seconds = max(5.0, min(float(os.getenv("AI_PROVIDER_TIMEOUT_SECONDS", "12")), 20.0))
     last_error = None
-    for provider_name, provider in providers:
+    for index, model_name in enumerate(models):
         try:
+            # ChatActionSender refreshes Telegram's typing indicator while Gemini works.
             async with ChatActionSender(bot=bot, chat_id=message.chat.id, action="typing"):
-                if provider == "gemini":
-                    from google import genai
-                    client = ai_client or genai.Client(api_key=GEMINI_API_KEY)
-                    model_names = []
-                    primary = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
-                    fallback = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash-lite").strip()
-                    if primary:
-                        model_names.append(primary)
-                    if fallback and fallback not in model_names:
-                        model_names.append(fallback)
-                    provider_error = None
-                    answer = ""
-                    for model_name in model_names:
-                        try:
-                            response = await asyncio.wait_for(
-                                client.aio.models.generate_content(model=model_name, contents=conversation),
-                                timeout=timeout_seconds,
-                            )
-                            answer = (getattr(response, "text", None) or "").strip()
-                            if answer:
-                                break
-                            provider_error = RuntimeError("Gemini returned an empty answer")
-                        except Exception as exc:
-                            provider_error = exc
-                            detail = str(exc).lower()
-                            # Invalid model names won't be fixed by trying another key/provider model.
-                            if "not found" in detail or "model" in detail and ("404" in detail or "not supported" in detail):
-                                continue
-                            # For quota/auth/network errors, fail over to the next provider promptly.
-                            break
-                    else:
-                        answer = ""
-                    if not answer:
-                        raise provider_error or RuntimeError("Gemini returned no answer")
-                else:
-                    configs = {
-                        "openai": ("https://api.openai.com/v1/chat/completions", "OPENAI_API_KEY", OPENAI_MODEL),
-                        "groq": ("https://api.groq.com/openai/v1/chat/completions", "GROQ_API_KEY", os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")),
-                        "cerebras": ("https://api.cerebras.ai/v1/chat/completions", "CEREBRAS_API_KEY", os.getenv("CEREBRAS_MODEL", "llama3.1-8b")),
-                        "openrouter": ("https://openrouter.ai/api/v1/chat/completions", "OPENROUTER_API_KEY", os.getenv("OPENROUTER_MODEL", "openai/gpt-oss-20b")),
-                    }
-                    url, key_name, model_name = configs[provider]
-                    api_key = os.getenv(key_name, "").strip()
-                    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-                    if provider == "openrouter":
-                        headers["HTTP-Referer"] = os.getenv("OPENROUTER_SITE_URL", "https://t.me/")
-                        headers["X-Title"] = "Anonymous Mini"
-                    request_timeout = aiohttp.ClientTimeout(total=timeout_seconds, connect=min(2.0, timeout_seconds))
-                    async with aiohttp.ClientSession(timeout=request_timeout) as session:
-                        request_payload = {"model": model_name, "messages": messages}
-                        if provider == "openai":
-                            # GPT-6 Astra supports reasoning_effort; omit temperature for reasoning models.
-                            request_payload["reasoning_effort"] = os.getenv("OPENAI_REASONING_EFFORT", "low").strip() or "low"
-                        else:
-                            request_payload["temperature"] = 0.7
-                        async with session.post(url, headers=headers, json=request_payload) as response:
-                            payload = await response.json(content_type=None)
-                            if response.status >= 400:
-                                error_info = payload.get("error", payload) if isinstance(payload, dict) else payload
-                                raise RuntimeError(f"{provider_name} HTTP {response.status}: {str(error_info)[:500]}")
-                    if not isinstance(payload, dict):
-                        raise RuntimeError(f"{provider_name} returned an invalid response format")
-                    choices = payload.get("choices") or []
-                    first_choice = choices[0] if choices and isinstance(choices[0], dict) else {}
-                    answer_content = (first_choice.get("message") or {}).get("content", "")
-                    if isinstance(answer_content, list):
-                        answer_content = "".join(str(part.get("text", "")) if isinstance(part, dict) else str(part) for part in answer_content)
-                    answer = str(answer_content or "").strip()
-                    if not answer:
-                        raise RuntimeError(f"{provider_name} returned an empty answer or no choices: {str(payload)[:300]}")
-
+                response = await ai_client.aio.models.generate_content(
+                    model=model_name,
+                    contents=conversation,
+                )
+            answer = (getattr(response, "text", None) or "").strip()
+            if not answer:
+                answer = "Hmm, I couldn't put that into words just now. Try asking me again."
             if len(answer) > 4000:
                 answer = answer[:3900] + "\n\n…(message shortened)"
             await message.reply(answer)
             history.extend([("user", prompt), ("assistant", answer)])
             AI_HISTORY[history_key] = history[-(AI_HISTORY_TURNS * 2):]
-            log.info("AI request succeeded with %s", provider_name)
             return
         except Exception as exc:
             last_error = exc
-            # Include the provider's actual rejection reason in Render logs, but never API keys.
-            detail = (str(exc).replace("\n", " ").strip() or repr(exc))[:700]
-            for secret_name in ("OPENAI_API_KEY", "GEMINI_API_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY", "OPENROUTER_API_KEY"):
-                secret_value = os.getenv(secret_name, "").strip()
-                if secret_value:
-                    detail = detail.replace(secret_value, "[REDACTED]")
-            log.warning("AI provider %s failed (%s); switching immediately. Details: %s",
-                        provider_name, type(exc).__name__, detail or "<no error detail returned>")
-            continue
+            detail = str(exc).lower()
+            is_quota_error = (
+                "quota" in detail or "resource_exhausted" in detail
+                or "rate limit" in detail or "429" in detail
+            )
+            if is_quota_error and index < len(models) - 1:
+                log.warning(
+                    "Gemini model %s hit a quota/rate limit; trying fallback model %s",
+                    model_name, models[index + 1]
+                )
+                continue
 
-    final_detail = (str(last_error).replace("\n", " ").strip() or repr(last_error))[:700] if last_error else "none"
-    for secret_name in ("OPENAI_API_KEY", "GEMINI_API_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY", "OPENROUTER_API_KEY"):
-        secret_value = os.getenv(secret_name, "").strip()
-        if secret_value:
-            final_detail = final_detail.replace(secret_value, "[REDACTED]")
-    log.error("All configured AI providers failed; last error type=%s details=%s",
-              type(last_error).__name__ if last_error else "unknown", final_detail)
-    await message.reply("⚠️ I'm temporarily busy. Please try again in a moment.")
+            log.exception("Gemini AI request failed using model %s", model_name)
+            name = type(exc).__name__.lower()
+            if "auth" in name or "api key" in detail or "permission" in name:
+                reply = "⚠️ Gemini rejected the API key. Check GEMINI_API_KEY in Render Environment."
+            elif is_quota_error:
+                reply = (
+                    "⚠️ Gemini's available quota is exhausted for the configured and fallback models. "
+                    "Please wait for quota to reset or check Google AI Studio usage."
+                )
+            elif "model" in detail or "not found" in detail:
+                reply = f"⚠️ Gemini model '{model_name}' isn't available for this key. Check GEMINI_MODEL in Render Environment."
+            else:
+                reply = "⚠️ Gemini couldn't answer just now. Check the latest Render logs for the exact error."
+            await message.reply(reply)
+            return
+
+    if last_error:
+        log.error("All configured Gemini models failed: %s", last_error)
+        await message.reply("⚠️ Gemini couldn't answer right now. Please try again later or check AI Studio usage.")
+
+# Reply-based group moderation commands.
+@dp.message(Command("ban"))
+async def ban_command(message: Message):
+    if not await require_admin(message): return
+    target = await replied_target(message)
+    if not target: return
+    try:
+        await bot.ban_chat_member(message.chat.id, target.id)
+        await message.answer(f"🔨 Banned <a href=\"tg://user?id={target.id}\">{target.full_name}.")
+    except Exception as e:
+        await message.answer(f"❌ I couldn't ban that user. Check my admin permissions.\n{type(e).__name__}")
 
 
 @dp.message(Command("unban"))
@@ -892,146 +765,6 @@ async def unban_command(message: Message):
         await message.answer(f"✅ Unbanned {target.full_name} (if they were banned).")
     except Exception:
         await message.answer("❌ I couldn't unban that user. Check my admin permissions.")
-
-
-@dp.message(Command("promote"))
-async def promote_command(message: Message):
-    """Promote the replied-to group member to a standard moderator."""
-    if not await require_admin(message):
-        return
-    target = await replied_target(message)
-    if not target:
-        return
-    if not await bot_can_promote_members(message):
-        return
-    if message.from_user and target.id == message.from_user.id:
-        await message.reply("⚠️ You cannot use /promote on yourself.")
-        return
-    try:
-        await bot.promote_chat_member(
-            chat_id=message.chat.id,
-            user_id=target.id,
-            can_manage_chat=False,
-            can_change_info=False,
-            can_post_messages=False,
-            can_edit_messages=False,
-            can_delete_messages=True,
-            can_manage_video_chats=False,
-            can_restrict_members=True,
-            can_promote_members=False,
-            can_invite_users=True,
-            can_pin_messages=True,
-            can_manage_topics=False,
-            can_post_stories=False,
-            can_edit_stories=False,
-            can_delete_stories=False,
-        )
-        await message.answer(
-            f"✅ Promoted <a href=\"tg://user?id={target.id}\">{html_lib.escape(target.full_name)}</a> to group admin with standard moderation rights.",
-            parse_mode="HTML",
-        )
-    except Exception as exc:
-        detail = getattr(exc, "message", None) or str(exc)
-        await message.answer(
-            "❌ I couldn't promote that member. Make sure I'm an admin with the right to add administrators, "
-            "and that you have permission to manage this member.\n"
-            f"Details: {html_lib.escape(str(detail)[:400])}",
-            parse_mode="HTML",
-        )
-
-
-@dp.message(Command("demote"))
-async def demote_command(message: Message):
-    """Remove admin rights from the replied-to administrator."""
-    if not await require_admin(message):
-        return
-    target = await replied_target(message)
-    if not target:
-        return
-    if not await bot_can_promote_members(message):
-        return
-    if message.from_user and target.id == message.from_user.id:
-        await message.reply("⚠️ You cannot use /demote on yourself.")
-        return
-    try:
-        member = await bot.get_chat_member(message.chat.id, target.id)
-        if member.status not in ("administrator", "creator"):
-            await message.answer(f"ℹ️ {html_lib.escape(target.full_name)} is not a group administrator.", parse_mode="HTML")
-            return
-        if member.status == "creator":
-            await message.answer("❌ The group owner cannot be demoted by a bot.")
-            return
-        await bot.promote_chat_member(
-            chat_id=message.chat.id,
-            user_id=target.id,
-            can_manage_chat=False,
-            can_change_info=False,
-            can_post_messages=False,
-            can_edit_messages=False,
-            can_delete_messages=False,
-            can_manage_video_chats=False,
-            can_restrict_members=False,
-            can_promote_members=False,
-            can_invite_users=False,
-            can_pin_messages=False,
-            can_manage_topics=False,
-            can_post_stories=False,
-            can_edit_stories=False,
-            can_delete_stories=False,
-        )
-        await message.answer(f"✅ Removed administrator rights from <a href=\"tg://user?id={target.id}\">{html_lib.escape(target.full_name)}</a>.", parse_mode="HTML")
-    except Exception as exc:
-        detail = getattr(exc, "message", None) or str(exc)
-        await message.answer(
-            "❌ I couldn't demote that administrator. Make sure I'm an admin with the right to add administrators, "
-            "and that you have permission to manage this member.\n"
-            f"Details: {html_lib.escape(str(detail)[:400])}",
-            parse_mode="HTML",
-        )
-
-
-
-@dp.message(Command("purge"))
-async def purge_command(message: Message):
-    """Delete a replied-to message and up to N preceding messages in a group."""
-    if not await require_admin(message):
-        return
-    if not message.reply_to_message:
-        await message.reply("🧹 Reply to the last message you want removed, then use /purge or /purge 20. I can delete up to 100 messages at a time.")
-        return
-    try:
-        parts = (message.text or "").split()
-        count = int(parts[1]) if len(parts) > 1 else 1
-        if count < 1 or count > 100:
-            await message.reply("⚠️ Choose a count from 1 to 100.")
-            return
-    except ValueError:
-        await message.reply("Usage: reply to a message with /purge [count]")
-        return
-    if not getattr(message.chat, "permissions", None) and message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-        return
-    start_id = message.reply_to_message.message_id
-    deleted = 0
-    # Telegram has no history-list API, so delete consecutive IDs backwards from the replied-to message.
-    for message_id in range(start_id, max(0, start_id-count), -1):
-        try:
-            await bot.delete_message(message.chat.id, message_id)
-            deleted += 1
-        except TelegramBadRequest:
-            continue
-        except TelegramForbiddenError:
-            await message.answer("❌ I need permission to delete messages in this group.")
-            return
-        except Exception as exc:
-            log.warning("Purge delete failed: %s", type(exc).__name__)
-    try:
-        await bot.delete_message(message.chat.id, message.message_id)
-    except Exception:
-        pass
-    try:
-        await bot.send_message(message.chat.id, f"🧹 Purge complete: deleted {deleted} message(s).")
-    except Exception:
-        pass
 
 
 @dp.message(Command("kick"))
@@ -1134,49 +867,7 @@ async def founder_handler(message: Message):
     )
 
 
-@dp.message(F.voice)
-async def long_voice_note_handler(message: Message):
-    voice = message.voice
-    if voice and voice.duration >= 600:
-        await message.reply("🗣️😂 Summary abeg! This voice note na full episode. Give us the short version.")
-
-
-# Playful phrase-trigger detector: it cannot determine whether a claim is actually false.
-CAP_PHRASES = (
-    "trust me bro", "source: trust me", "my uncle works at", "i swear on", "100% real",
-    "everybody knows", "they don't want you to know", "no evidence but", "i heard from a guy",
-)
-
-@dp.message(
-    F.text & ~F.text.startswith("/") & (
-        F.text.lower().contains("trust me bro")
-        | F.text.lower().contains("source: trust me")
-        | F.text.lower().contains("my uncle works at")
-        | F.text.lower().contains("i swear on")
-        | F.text.lower().contains("100% real")
-        | F.text.lower().contains("everybody knows")
-        | F.text.lower().contains("they don't want you to know")
-        | F.text.lower().contains("no evidence but")
-        | F.text.lower().contains("i heard from a guy")
-    )
-)
-async def playful_lie_detector(message: Message):
-    if message.chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
-        return
-    text = (message.text or "").lower()
-    if not text or not any(phrase in text for phrase in CAP_PHRASES):
-        return
-    try:
-        if EWE_SOUND_FILE_ID:
-            await message.reply_audio(EWE_SOUND_FILE_ID, caption="🎬 Eweee! Anonymous™ cap detector don hear something suspicious 😂 (Just for jokes—verify claims yourself.)")
-        else:
-            await message.reply("🎬🔊 *Eweee!* 😂 Anonymous™ cap detector don hear something suspicious! Abeg bring source. (Na joke, no be real fact-check.)", parse_mode="Markdown")
-    except Exception as exc:
-        log.warning("Eweee sound send failed: %s", type(exc).__name__)
-        await message.reply("🎬🔊 Eweee! 😂 Abeg bring source—this detector na cruise, no be real fact-check.")
-
-
-@dp.message(F.text & ~F.text.startswith("/"))
+@dp.message(F.text)
 async def game_and_group_ai_handler(message: Message):
     text = (message.text or "").strip()
     if not text or text.startswith("/") or not message.from_user:
@@ -1240,46 +931,18 @@ async def pending_rows(chat_id: int):
     with sqlite3.connect(DATABASE_PATH) as conn:
         return conn.execute("SELECT user_id, username, full_name, created_at FROM pending_join_requests WHERE chat_id=? ORDER BY created_at", (chat_id,)).fetchall()
 
-async def bot_can_manage_join_requests(message: Message) -> bool:
-    """Check whether Telegram currently grants this bot join-request management rights."""
-    try:
-        me = await bot.get_me()
-        member = await bot.get_chat_member(message.chat.id, me.id)
-        if member.status not in ("administrator", "creator"):
-            await message.answer("❌ I must be a group administrator to manage join requests.")
-            return False
-        if member.status != "creator" and not getattr(member, "can_invite_users", False):
-            await message.answer(
-                "❌ I am an administrator, but Telegram does not report the 'Invite Users' permission for me. "
-                "Enable Invite Users / Manage Join Requests in my admin rights, then try again."
-            )
-            return False
-        return True
-    except Exception as exc:
-        log.warning("Join-request permission check failed (%s): %r", type(exc).__name__, exc)
-        await message.answer("❌ I couldn't verify my join-request permissions. Check Render Logs for details.")
-        return False
-
 @dp.message(Command("list"))
 async def list_pending_command(message: Message):
     parts = (message.text or "").split()
     if len(parts) < 2 or parts[1].lower() != "pending":
-        await message.answer("Usage: /list pending")
         return
     if not await require_admin(message):
         return
-    if not await bot_can_manage_join_requests(message):
-        return
     rows = await pending_rows(message.chat.id)
     if not rows:
-        await message.answer(
-            "📭 I have no tracked pending join requests for this group.\n\n"
-            "I can only list requests Telegram delivered to me while I was running and had admin access. "
-            "Requests created before tracking was active, or while the bot lacked Invite Users permission, "
-            "may not appear here. Ask someone to submit a new join request to test it."
-        )
+        await message.answer("📭 No tracked pending join requests for this group.")
         return
-    lines = ["⏳ Pending join requests tracked by me:"]
+    lines = ["⏳ Pending join requests:"]
     for user_id, username, full_name, created_at in rows[:50]:
         who = f"@{username}" if username else (full_name or "Unknown user")
         lines.append(f"• {who} — ID: <code>{user_id}</code>")
@@ -1288,8 +951,6 @@ async def list_pending_command(message: Message):
 
 async def process_pending_request(message: Message, approve: bool):
     if not await require_admin(message):
-        return
-    if not await bot_can_manage_join_requests(message):
         return
     parts = (message.text or "").split()
     if len(parts) < 3 or parts[1].lower() != "pending" or not parts[2].isdigit():
@@ -1309,13 +970,7 @@ async def process_pending_request(message: Message, approve: bool):
         await message.answer(f"✅ {verb} join request for <code>{user_id}</code>.", parse_mode="HTML")
     except Exception as exc:
         action = "approve" if approve else "decline"
-        detail = str(exc).replace("\n", " ").strip() or repr(exc)
-        # These errors normally contain Telegram's reason (e.g. request not found / not pending).
-        log.warning("Could not %s join request chat_id=%s user_id=%s (%s): %s", action, message.chat.id, user_id, type(exc).__name__, detail[:500])
-        await message.answer(
-            f"❌ Couldn't {action} join request for <code>{user_id}</code>.\n"
-            f"Reason: <code>{html_lib.escape(detail[:350])}</code>", parse_mode="HTML"
-        )
+        await message.answer(f"Couldn't {action} that request. Ensure the bot is an admin with invite-user permissions and the request is still pending. ({type(exc).__name__})")
 
 @dp.message(Command("approve"))
 async def approve_pending_command(message: Message):
@@ -1329,9 +984,6 @@ async def decline_pending_command(message: Message):
 async def owner_stats_command(message: Message):
     if not owner_only(message):
         await message.answer("⛔ Owner-only command.")
-        return
-    if message.chat.type != ChatType.PRIVATE:
-        await message.answer("🔒 For privacy, use /stats in my private chat.")
         return
     with sqlite3.connect(DATABASE_PATH) as conn:
         dm_users = conn.execute("SELECT COUNT(DISTINCT user_id) FROM users WHERE private_chat_id IS NOT NULL").fetchone()[0]
@@ -1348,9 +1000,6 @@ async def owner_stats_command(message: Message):
 async def owner_broadcast_command(message: Message):
     if not owner_only(message):
         await message.answer("⛔ Owner-only command.")
-        return
-    if message.chat.type != ChatType.PRIVATE:
-        await message.answer("🔒 For safety, run /broadcast from my private chat.")
         return
     announcement = (message.text or "").partition(" ")[2].strip()
     if not announcement:
@@ -1403,9 +1052,6 @@ async def main():
         BotCommand(command="commands", description="List commands"),
         BotCommand(command="about", description="About this bot"),
         BotCommand(command="ping", description="Check bot status"),
-        BotCommand(command="promote", description="Promote replied-to group member"),
-        BotCommand(command="demote", description="Demote replied-to group admin"),
-        BotCommand(command="purge", description="Delete recent group messages"),
         BotCommand(command="joke", description="Get a random joke"),
         BotCommand(command="fact", description="Get a random fact"),
         BotCommand(command="quote", description="Get a motivational quote"),
@@ -1417,7 +1063,6 @@ async def main():
         BotCommand(command="dare", description="Get a dare"),
         BotCommand(command="riddle", description="Get a riddle"),
         BotCommand(command="quiz", description="Set up a timed category quiz"),
-        BotCommand(command="flirt", description="Send a playful flirt line"),
         BotCommand(command="list", description="List pending join requests: /list pending"),
         BotCommand(command="approve", description="Approve pending join request"),
         BotCommand(command="decline", description="Decline pending join request"),
@@ -1425,19 +1070,10 @@ async def main():
         BotCommand(command="broadcast", description="Owner announcement broadcast"),
         BotCommand(command="ai", description="Ask AI"),
     ]
-    # Keep owner-only commands out of the public menus. Telegram command menus are
-    # visibility only; handlers below still enforce OWNER_ID for security.
-    owner_command_names = {"stats", "broadcast"}
-    public_commands = [command for command in commands if command.command not in owner_command_names]
-    await bot.set_my_commands(public_commands, scope=BotCommandScopeAllPrivateChats())
-    group_commands = [command for command in public_commands if command.command not in {"stats", "broadcast"}]
+    # Telegram has separate command menus for groups and private chats.
+    await bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats())
+    group_commands = commands[:]
     await bot.set_my_commands(group_commands, scope=BotCommandScopeAllGroupChats())
-    if OWNER_ID:
-        owner_commands = public_commands + [command for command in commands if command.command in owner_command_names]
-        await bot.set_my_commands(owner_commands, scope=BotCommandScopeChat(chat_id=OWNER_ID))
-        log.info("Owner-only command menu configured for OWNER_ID=%s", OWNER_ID)
-    else:
-        log.warning("OWNER_ID is not configured. /stats and /broadcast will be inaccessible until OWNER_ID is set in Render Environment.")
     runner = await start_http_server()
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
