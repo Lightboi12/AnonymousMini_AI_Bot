@@ -80,7 +80,7 @@ def owner_only(message: Message) -> bool:
 FOUNDER_NAME = "𝐋 𝐎 𝐑 𝐃 ♰ 𝐀𝐍𝐎𝐍𝐘𝐌𝐎𝐔𝐒™"
 FOUNDER_URL = "https://t.me/i_amanonymous"
 FOUNDER_REPLY = (
-    f'My founder is <a href="{FOUNDER_URL}">'
+    f'That's the boss right there, <a href="{FOUNDER_URL}">'
     f'{FOUNDER_NAME}</a> 👑'
 )
 
