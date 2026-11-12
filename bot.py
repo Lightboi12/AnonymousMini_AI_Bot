@@ -52,13 +52,10 @@ def InlineKeyboardButton(**kwargs):
 def init_database():
     with sqlite3.connect(DATABASE_PATH) as conn:
         conn.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, private_chat_id INTEGER, first_seen TEXT NOT NULL, last_seen TEXT NOT NULL)")
-        conn.execute("CREATE TABLE IF NOT EXISTS chats (chat_id INTEGER PRIMARY KEY, chat_type TEXT NOT NULL, title TEXT, first_seen TEXT NOT NULL, last_seen TEXT NOT NULL, bot_is_member INTEGER NOT NULL DEFAULT 1)")
-        # Safe migration for databases created by earlier versions.
-        chat_columns = {row[1] for row in conn.execute("PRAGMA table_info(chats)").fetchall()}
-        if "bot_is_member" not in chat_columns:
-            conn.execute("ALTER TABLE chats ADD COLUMN bot_is_member INTEGER NOT NULL DEFAULT 1")
-        conn.execute("CREATE TABLE IF NOT EXISTS bot_stats (stat_key TEXT PRIMARY KEY, stat_value INTEGER NOT NULL DEFAULT 0)")
+        conn.execute("CREATE TABLE IF NOT EXISTS chats (chat_id INTEGER PRIMARY KEY, chat_type TEXT NOT NULL, title TEXT, first_seen TEXT NOT NULL, last_seen TEXT NOT NULL)")
         conn.execute("CREATE TABLE IF NOT EXISTS pending_join_requests (chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL, username TEXT, full_name TEXT, created_at TEXT NOT NULL, PRIMARY KEY(chat_id,user_id))")
+        conn.execute("CREATE TABLE IF NOT EXISTS bot_counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL DEFAULT 0)")
+        conn.execute("INSERT OR IGNORE INTO bot_counters(name,value) VALUES ('messages_seen',0)")
         conn.commit()
 
 def db_track_message(message: Message):
@@ -68,34 +65,9 @@ def db_track_message(message: Message):
             private_id = message.chat.id if message.chat.type == ChatType.PRIVATE else None
             conn.execute("INSERT INTO users(user_id,private_chat_id,first_seen,last_seen) VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET private_chat_id=COALESCE(excluded.private_chat_id,users.private_chat_id), last_seen=excluded.last_seen", (message.from_user.id, private_id, now, now))
         title = message.chat.title or message.chat.full_name or message.chat.username or str(message.chat.id)
-        conn.execute("INSERT INTO chats(chat_id,chat_type,title,first_seen,last_seen,bot_is_member) VALUES(?,?,?,?,?,1) ON CONFLICT(chat_id) DO UPDATE SET chat_type=excluded.chat_type,title=excluded.title,last_seen=excluded.last_seen", (message.chat.id, message.chat.type, title, now, now))
-        conn.execute("INSERT INTO bot_stats(stat_key,stat_value) VALUES('messages',1) ON CONFLICT(stat_key) DO UPDATE SET stat_value=stat_value+1")
+        conn.execute("INSERT INTO chats(chat_id,chat_type,title,first_seen,last_seen) VALUES(?,?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET chat_type=excluded.chat_type,title=excluded.title,last_seen=excluded.last_seen", (message.chat.id, message.chat.type, title, now, now))
+        conn.execute("UPDATE bot_counters SET value=value+1 WHERE name='messages_seen'")
         conn.commit()
-
-@dp.my_chat_member()
-async def track_bot_group_membership(event: ChatMemberUpdated):
-    """Record groups immediately when the bot is added/removed, without waiting for a message."""
-    chat = event.chat
-    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-        return
-    new_status = event.new_chat_member.status
-    is_member = new_status in ("member", "administrator", "creator")
-    now = datetime.now(timezone.utc).isoformat()
-    title = chat.title or str(chat.id)
-    try:
-        with sqlite3.connect(DATABASE_PATH) as conn:
-            conn.execute(
-                "INSERT INTO chats(chat_id,chat_type,title,first_seen,last_seen,bot_is_member) "
-                "VALUES(?,?,?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET "
-                "chat_type=excluded.chat_type,title=excluded.title,last_seen=excluded.last_seen,"
-                "bot_is_member=excluded.bot_is_member",
-                (chat.id, chat.type, title, now, now, 1 if is_member else 0),
-            )
-            conn.commit()
-        log.info("Bot group membership updated: chat_id=%s active=%s", chat.id, is_member)
-    except Exception:
-        log.exception("Could not save bot group membership for chat %s", chat.id)
-
 
 class TrackingMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
@@ -111,7 +83,7 @@ def owner_only(message: Message) -> bool:
 FOUNDER_NAME = "𝐋 𝐎 𝐑 𝐃 ♰ 𝐀𝐍𝐎𝐍𝐘𝐌𝐎𝐔𝐒™"
 FOUNDER_URL = "https://t.me/i_amanonymous"
 FOUNDER_REPLY = (
-    f"That's the boss right there, <a href=\"{FOUNDER_URL}\">"
+    f"That\'s the boss right there, <a href=\"{FOUNDER_URL}\">"
     f'{FOUNDER_NAME}</a> 👑'
 )
 
@@ -121,6 +93,29 @@ if not TOKEN:
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 started_at = time.time()
+
+@dp.my_chat_member()
+async def track_bot_membership(event: ChatMemberUpdated):
+    """Persist groups/channels as soon as Telegram reports a bot membership change."""
+    now = datetime.now(timezone.utc).isoformat()
+    new_status = event.new_chat_member.status
+    old_status = event.old_chat_member.status
+    title = event.chat.title or event.chat.username or str(event.chat.id)
+    try:
+        with sqlite3.connect(DATABASE_PATH) as conn:
+            if new_status in ("member", "administrator"):
+                conn.execute(
+                    "INSERT INTO chats(chat_id,chat_type,title,first_seen,last_seen) VALUES(?,?,?,?,?) "
+                    "ON CONFLICT(chat_id) DO UPDATE SET chat_type=excluded.chat_type,title=excluded.title,last_seen=excluded.last_seen",
+                    (event.chat.id, event.chat.type, title, now, now),
+                )
+                log.info("Registered bot membership in %s (%s)", title, event.chat.id)
+            elif old_status in ("member", "administrator", "restricted") and new_status in ("left", "kicked"):
+                conn.execute("DELETE FROM chats WHERE chat_id=?", (event.chat.id,))
+                log.info("Removed bot membership record for %s (%s)", title, event.chat.id)
+            conn.commit()
+    except Exception:
+        log.exception("Could not update bot membership registry")
 bot_username = ""
 ai_client = None
 
@@ -773,7 +768,7 @@ async def ask_ai(message: Message, prompt: str):
         log.error("All configured Gemini models failed: %s", last_error)
         await message.reply("⚠️ Gemini couldn't answer right now. Please try again later or check AI Studio usage.")
 
-# Administrator management commands. Reply to the member you want to manage.
+# Reply-based group moderation commands.
 @dp.message(Command("promote"))
 async def promote_command(message: Message):
     if not await require_admin(message):
@@ -784,34 +779,19 @@ async def promote_command(message: Message):
     try:
         bot_member = await bot.get_chat_member(message.chat.id, (await bot.get_me()).id)
         if bot_member.status != "administrator" or not getattr(bot_member, "can_promote_members", False):
-            await message.reply("❌ I need to be an administrator with the 'Add New Admins' permission to promote members.")
+            await message.reply("⛔ I need to be a group administrator with the 'Add new admins' permission to promote members.")
             return
-        actor = await bot.get_chat_member(message.chat.id, message.from_user.id)
-        if actor.status != "creator" and not getattr(actor, "can_promote_members", False):
-            await message.reply("❌ You need the 'Add New Admins' permission to promote members.")
-            return
-        target_member = await bot.get_chat_member(message.chat.id, target.id)
-        if target_member.status in ("administrator", "creator"):
-            await message.reply("ℹ️ That member is already an administrator.")
-            return
-        # Grant a safe moderation set. Telegram will reject any permission the bot
-        # itself is not allowed to grant; the exception is reported clearly.
         await bot.promote_chat_member(
             chat_id=message.chat.id, user_id=target.id,
-            can_manage_chat=True, can_delete_messages=True,
-            can_restrict_members=True, can_invite_users=True,
-            can_pin_messages=True, can_manage_video_chats=True,
-            can_change_info=False, can_promote_members=False,
+            can_manage_chat=True, can_delete_messages=True, can_manage_video_chats=True,
+            can_restrict_members=True, can_promote_members=False, can_change_info=False,
+            can_invite_users=True, can_pin_messages=True, can_post_messages=False,
+            can_edit_messages=False, can_manage_topics=True,
         )
-        await message.reply(f"✅ <a href=\"tg://user?id={target.id}\">{html_lib.escape(target.full_name)}</a> has been promoted to administrator.", parse_mode="HTML")
+        await message.reply(f"✅ Promoted <a href=\"tg://user?id={target.id}\">{html_lib.escape(target.full_name)}</a> to administrator.", parse_mode="HTML")
     except Exception as exc:
-        log.exception("Promote failed in chat %s for user %s", message.chat.id, target.id)
-        await message.reply(
-            "❌ I couldn't promote that member. Check that you and the bot have 'Add New Admins' permission, "
-            "and that the target can be promoted.\n"
-            f"Details: {html_lib.escape(str(exc)[:350])}", parse_mode="HTML"
-        )
-
+        log.warning("Promote failed in chat %s for user %s: %s", message.chat.id, target.id, exc)
+        await message.reply("❌ I couldn't promote that member. Make sure you are an admin, the bot has 'Add new admins', and the target can be promoted.\nDetails: " + html_lib.escape(str(exc)[:300]), parse_mode="HTML")
 
 @dp.message(Command("demote"))
 async def demote_command(message: Message):
@@ -823,34 +803,20 @@ async def demote_command(message: Message):
     try:
         bot_member = await bot.get_chat_member(message.chat.id, (await bot.get_me()).id)
         if bot_member.status != "administrator" or not getattr(bot_member, "can_promote_members", False):
-            await message.reply("❌ I need to be an administrator with the 'Add New Admins' permission to demote admins.")
-            return
-        actor = await bot.get_chat_member(message.chat.id, message.from_user.id)
-        if actor.status != "creator" and not getattr(actor, "can_promote_members", False):
-            await message.reply("❌ You need the 'Add New Admins' permission to demote administrators.")
-            return
-        target_member = await bot.get_chat_member(message.chat.id, target.id)
-        if target_member.status != "administrator":
-            await message.reply("ℹ️ That member is not an administrator.")
+            await message.reply("⛔ I need to be a group administrator with the 'Add new admins' permission to demote administrators.")
             return
         await bot.promote_chat_member(
             chat_id=message.chat.id, user_id=target.id,
-            can_manage_chat=False, can_delete_messages=False,
-            can_restrict_members=False, can_invite_users=False,
-            can_pin_messages=False, can_manage_video_chats=False,
-            can_change_info=False, can_promote_members=False,
+            can_manage_chat=False, can_delete_messages=False, can_manage_video_chats=False,
+            can_restrict_members=False, can_promote_members=False, can_change_info=False,
+            can_invite_users=False, can_pin_messages=False, can_post_messages=False,
+            can_edit_messages=False, can_manage_topics=False,
         )
-        await message.reply(f"✅ <a href=\"tg://user?id={target.id}\">{html_lib.escape(target.full_name)}</a> has been demoted.", parse_mode="HTML")
+        await message.reply(f"✅ Removed administrator privileges from <a href=\"tg://user?id={target.id}\">{html_lib.escape(target.full_name)}</a>.", parse_mode="HTML")
     except Exception as exc:
-        log.exception("Demote failed in chat %s for user %s", message.chat.id, target.id)
-        await message.reply(
-            "❌ I couldn't demote that administrator. Check your and the bot's admin permissions, "
-            "and make sure the target is below your admin rank.\n"
-            f"Details: {html_lib.escape(str(exc)[:350])}", parse_mode="HTML"
-        )
+        log.warning("Demote failed in chat %s for user %s: %s", message.chat.id, target.id, exc)
+        await message.reply("❌ I couldn't demote that member. The bot must have 'Add new admins' permission and sufficient authority over the target.\nDetails: " + html_lib.escape(str(exc)[:300]), parse_mode="HTML")
 
-
-# Reply-based group moderation commands.
 @dp.message(Command("ban"))
 async def ban_command(message: Message):
     if not await require_admin(message): return
@@ -1095,15 +1061,14 @@ async def owner_stats_command(message: Message):
         return
     with sqlite3.connect(DATABASE_PATH) as conn:
         dm_users = conn.execute("SELECT COUNT(DISTINCT user_id) FROM users WHERE private_chat_id IS NOT NULL").fetchone()[0]
-        group_count = conn.execute("SELECT COUNT(*) FROM chats WHERE chat_type IN ('group','supergroup') AND bot_is_member=1").fetchone()[0]
+        group_count = conn.execute("SELECT COUNT(*) FROM chats WHERE chat_type IN ('group','supergroup')").fetchone()[0]
         channel_count = conn.execute("SELECT COUNT(*) FROM chats WHERE chat_type='channel'").fetchone()[0]
         users_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        messages_count = conn.execute("SELECT COALESCE(stat_value,0) FROM bot_stats WHERE stat_key='messages'").fetchone()
-        messages_count = messages_count[0] if messages_count else 0
+        messages_count = conn.execute("SELECT value FROM bot_counters WHERE name='messages_seen'").fetchone()[0]
     await message.answer(
         f"👑 <b>Anonymous™ Mini — Owner Stats</b>\n\n👤 Unique users seen: <b>{users_count}</b>\n"
         f"💬 Users who opened/used the bot in DMs: <b>{dm_users}</b>\n👥 Groups/supergroups seen: <b>{group_count}</b>\n"
-        f"📣 Channels seen: <b>{channel_count}</b>\n\n<i>Counts are based on chats/messages the bot has actually received since this database was enabled.</i>",
+        f"📣 Channels seen: <b>{channel_count}</b>\n✉️ Messages tracked: <b>{messages_count}</b>\n\n<i>Records are stored in SQLite and survive code redeploys only when DATABASE_PATH points to persistent storage.</i>",
         parse_mode="HTML")
 
 @dp.message(Command("broadcast"))
@@ -1117,7 +1082,7 @@ async def owner_broadcast_command(message: Message):
         return
     with sqlite3.connect(DATABASE_PATH) as conn:
         targets = {row[0] for row in conn.execute("SELECT private_chat_id FROM users WHERE private_chat_id IS NOT NULL").fetchall()}
-        targets.update(row[0] for row in conn.execute("SELECT chat_id FROM chats WHERE chat_type IN ('group','supergroup') AND bot_is_member=1").fetchall())
+        targets.update(row[0] for row in conn.execute("SELECT chat_id FROM chats WHERE chat_type IN ('group','supergroup')").fetchall())
     sent = failed = 0
     for target in targets:
         try:
@@ -1162,8 +1127,6 @@ async def main():
         BotCommand(command="commands", description="List commands"),
         BotCommand(command="about", description="About this bot"),
         BotCommand(command="ping", description="Check bot status"),
-        BotCommand(command="promote", description="Promote replied-to group member"),
-        BotCommand(command="demote", description="Demote replied-to group admin"),
         BotCommand(command="joke", description="Get a random joke"),
         BotCommand(command="fact", description="Get a random fact"),
         BotCommand(command="quote", description="Get a motivational quote"),
@@ -1182,13 +1145,13 @@ async def main():
         BotCommand(command="broadcast", description="Owner announcement broadcast"),
         BotCommand(command="ai", description="Ask AI"),
     ]
-    # Owner-only commands are hidden from public menus and still protected in handlers.
+    # Keep owner commands visible only in the owner's private command menu.
     owner_names = {"stats", "broadcast"}
-    public_commands = [command for command in commands if command.command not in owner_names]
+    public_commands = [c for c in commands if c.command not in owner_names]
     await bot.set_my_commands(public_commands, scope=BotCommandScopeAllPrivateChats())
     await bot.set_my_commands(public_commands, scope=BotCommandScopeAllGroupChats())
     if OWNER_ID:
-        owner_commands = public_commands + [command for command in commands if command.command in owner_names]
+        owner_commands = public_commands + [c for c in commands if c.command in owner_names]
         await bot.set_my_commands(owner_commands, scope=BotCommandScopeChat(chat_id=OWNER_ID))
     else:
         log.warning("OWNER_ID is not set; /stats and /broadcast will reject all users.")
