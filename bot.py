@@ -196,7 +196,7 @@ COMMANDS_TEXT = (
     "/ai your question — Ask AI (requires API key)\n"
     "In groups, mention Anonymous followed by your question.\n\n"
     "🛡️ Group admins\n"
-    "/ban, /unban, /kick, /mute, /unmute, /warn, /warnings\n"
+    "/promote, /demote, /ban, /unban, /kick, /mute, /unmute, /warn, /warnings\n"
     "Use these in a group and reply to the person’s message."
 )
 
